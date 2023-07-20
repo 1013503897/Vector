@@ -202,7 +202,7 @@ public final class XposedHelpers {
         if (classLoader == null)
             classLoader = XposedBridge.BOOTCLASSLOADER;
         try {
-            return ClassUtils.getClass(classLoader, className, false);
+            return classLoader.loadClass(className);
         } catch (ClassNotFoundException e) {
             throw new ClassNotFoundError(e);
         }
