@@ -59,8 +59,10 @@ namespace lspd {
 # define LP_SELECT(lp32, lp64) lp32
 #endif
 
-    inline static constexpr auto kLibArtName = "libart.so"_tstr;
-    inline static constexpr auto kLibFwName = "libandroidfw.so"_tstr;
+    inline static constexpr auto kLibArtName = "libart.so";
+    inline static constexpr auto kLibBinderName = "libbinder.so";
+    inline static constexpr auto kLibFwName = "libandroidfw.so";
+    inline static constexpr auto kLinkerName = "/linker";
 
     inline constexpr const char *BoolToString(bool b) {
         return b ? "true" : "false";
