@@ -200,7 +200,8 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
             rename(".*\\.apk", "daemon.apk")
         }
         into("lib") {
-            from(layout.buildDirectory.dir("intermediates/stripped_native_libs/$variantCapped/out/lib")) {
+            val libDir = variantCapped + "/strip${variantCapped}DebugSymbols"
+            from(layout.buildDirectory.dir("intermediates/stripped_native_libs/$libDir/out/lib")) {
                 include("**/liblspd.so")
             }
         }
@@ -303,7 +304,7 @@ val pushDaemonNative = task<Exec>("pushDaemonNative") {
             }
             outputStream.toString().trim()
         }
-        workingDir(project(":daemon").layout.buildDirectory.dir("intermediates/stripped_native_libs/debug/out/lib/$abi"))
+        workingDir(project(":daemon").layout.buildDirectory.dir("intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib/$abi"))
     }
     commandLine(adb, "push", "libdaemon.so", "/data/local/tmp/libdaemon.so")
 }
