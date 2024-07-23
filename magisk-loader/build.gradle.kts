@@ -30,7 +30,7 @@ plugins {
 
 val moduleName = "LSPosed"
 val moduleBaseId = "lsposed"
-val authors = "LSPosed Developers"
+val authors = "Jing Matrix & LSPosed Developers"
 
 val riruModuleId = "lsposed"
 val moduleMinRiruApiVersion = 26
@@ -159,7 +159,7 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
                 "versionName" to "v$verName",
                 "versionCode" to verCode,
                 "authorList" to authors,
-                "updateJson" to "https://lsposed.github.io/LSPosed/release/${flavorLowered}.json",
+                "updateJson" to "https://raw.githubusercontent.com/JingMatrix/LSPosed/master/magisk-loader/update/${flavorLowered}.json",
                 "requirement" to when (flavorLowered) {
                     "riru" -> "Requires Riru $moduleMinRiruVersionName or above installed"
                     "zygisk" -> "Requires Magisk 24.0+ and Zygisk enabled"

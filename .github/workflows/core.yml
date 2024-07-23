@@ -41,13 +41,14 @@ jobs:
           fi
 
       - name: Checkout libxposed/api
-        uses: actions/checkout@v3
+        uses: actions/checkout@main
         with:
           repository: libxposed/api
           path: libxposed/api
+          ref: 54582730315ba4a3d7cfaf9baf9d23c419e07006
 
       - name: Checkout libxposed/service
-        uses: actions/checkout@v3
+        uses: actions/checkout@main
         with:
           repository: libxposed/service
           path: libxposed/service
@@ -63,13 +64,25 @@ jobs:
         with:
           gradle-home-cache-cleanup: true
 
-      - name: Set up ccache
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup ninja
+        uses: seanmiddleditch/gha-setup-ninja@master
+        with:
+          version: 1.12.0
+
+      - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           max-size: 2G
           key: ${{ runner.os }}
           restore-keys: ${{ runner.os }}
           save: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+
+      - name: Remove Android's cmake
+        shell: bash
+        run: rm -rf $ANDROID_HOME/cmake
 
       - name: Build dependencies
         working-directory: libxposed
