@@ -1,6 +1,6 @@
 # LSPosed Framework
 
-[![Build](https://img.shields.io/github/actions/workflow/status/JingMatrix/LSPosed/core.yml?branch=master&event=push&logo=github&label=Build)](https://github.com/JingMatrix/LSPosed/actions/workflows/core.yml?query=event%3Apush+branch%3Amaster+is%3Acompleted) [![Download](https://img.shields.io/github/v/release/JingMatrix/LSPosed?color=orange&logoColor=orange&label=Download&logo=DocuSign)](https://github.com/JingMatrix/LSPosed/releases/latest) [![Total](https://shields.io/github/downloads/JingMatrix/LSPosed/total?logo=Bookmeter&label=Counts&logoColor=yellow&color=yellow)](https://github.com/JingMatrix/LSPosed/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/JingMatrix/LSPosed/core.yml?branch=master&event=push&logo=github&label=Build)](https://github.com/JingMatrix/LSPosed/actions/workflows/core.yml?query=event%3Apush+branch%3Amaster+is%3Acompleted) [![Crowdin](https://img.shields.io/badge/Localization-Crowdin-blueviolet?logo=Crowdin)](https://crowdin.com/project/lsposed_jingmatrix) [![Download](https://img.shields.io/github/v/release/JingMatrix/LSPosed?color=orange&logoColor=orange&label=Download&logo=DocuSign)](https://github.com/JingMatrix/LSPosed/releases/latest) [![Total](https://shields.io/github/downloads/JingMatrix/LSPosed/total?logo=Bookmeter&label=Counts&logoColor=yellow&color=yellow)](https://github.com/JingMatrix/LSPosed/releases)
 
 ## Introduction 
 
@@ -49,9 +49,9 @@ We use our own module repository. We welcome developers to submit modules to our
 
 Notice: These community groups don't accept any bug report, please use [Get help](#get-help) to report.
 
-<!-- ## Translation Contributing -->
+## Translation Contributing
 
-<!-- You can contribute translation [here](https://lsposed.crowdin.com/lsposed). -->
+You can contribute translation [here](https://crowdin.com/project/lsposed_jingmatrix).
 
 ## Credits 
 
