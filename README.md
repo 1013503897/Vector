@@ -58,7 +58,7 @@ You can contribute translation [here](https://crowdin.com/project/lsposed_jingma
 - [Magisk](https://github.com/topjohnwu/Magisk/): makes all these possible
 - [Riru](https://github.com/RikkaApps/Riru): provides a way to inject code into zygote process
 - [XposedBridge](https://github.com/rovo89/XposedBridge): the OG Xposed framework APIs
-- [Dobby](https://github.com/jmpews/Dobby): used for inline hooking
+- [Dobby](https://github.com/chiteroman/Dobby): used for inline hooking
 - [LSPlant](https://github.com/JingMatrix/LSPlant): the core ART hooking framework
 - [EdXposed](https://github.com/ElderDrivers/EdXposed): fork source
 - ~[SandHook](https://github.com/ganyao114/SandHook/): ART hooking framework for SandHook variant~

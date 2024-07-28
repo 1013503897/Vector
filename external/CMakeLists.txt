@@ -4,7 +4,6 @@ macro(SET_OPTION option value)
     set(${option} ${value} CACHE INTERNAL "" FORCE)
 endmacro()
 
-SET_OPTION(DOBBY_GENERATE_SHARED OFF)
 SET_OPTION(Plugin.SymbolResolver OFF)
 SET_OPTION(FMT_INSTALL OFF)
 

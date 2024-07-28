@@ -73,7 +73,7 @@ namespace lspd {
             return InstallNativeAPI({
                 .inline_hooker = [](auto t, auto r) {
                     void* bk = nullptr;
-                    return HookFunction(t, r, &bk) == RS_SUCCESS ? bk : nullptr;
+                    return HookFunction(t, r, &bk) == 0 ? bk : nullptr;
                 },
             });
         }();
