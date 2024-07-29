@@ -26,8 +26,8 @@ import android.content.res.Resources;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import org.apache.commons.lang3.ClassUtils;
-import org.apache.commons.lang3.reflect.MemberUtilsX;
+import org.apache.commons.lang3.local.ClassUtils;
+import org.apache.commons.lang3.local.reflect.MemberUtilsX;
 
 import java.io.ByteArrayOutputStream;
 import java.io.FileInputStream;
@@ -202,7 +202,7 @@ public final class XposedHelpers {
         if (classLoader == null)
             classLoader = XposedBridge.BOOTCLASSLOADER;
         try {
-            return classLoader.loadClass(className);
+            return ClassUtils.getClass(classLoader, className, false);
         } catch (ClassNotFoundException e) {
             throw new ClassNotFoundError(e);
         }
