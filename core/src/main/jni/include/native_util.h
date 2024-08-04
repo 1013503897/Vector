@@ -78,10 +78,10 @@ inline bool RegisterNativeMethodsInternal(JNIEnv *env, std::string_view class_na
 
 static dev_t dev = 0;
 static ino_t inode = 0;
-static std::vector<std::pair<std::string_view, void **>> plt_hook_saved = {};
+static std::vector<std::pair<const char *, void **>> plt_hook_saved = {};
 
 inline int HookArtFunction(void *art_symbol, void *callback, void **backup, bool save = true) {
-    auto symbol = *reinterpret_cast<std::string_view *>(art_symbol);
+    auto symbol = reinterpret_cast<const char *>(art_symbol);
 
     if (GetArt()->isStripped()) {
         if (dev == 0 || inode == 0) {
@@ -105,7 +105,7 @@ inline int HookArtFunction(void *art_symbol, void *callback, void **backup, bool
 
     if (auto addr = GetArt()->getSymbAddress(symbol); addr) {
         Dl_info info;
-        if (dladdr(addr, &info) && info.dli_sname != nullptr && info.dli_sname == symbol)
+        if (dladdr(addr, &info) && info.dli_sname != nullptr && strcmp(info.dli_sname, symbol) == 0)
             HookFunction(addr, callback, backup);
     } else if (*backup == nullptr && isDebug) {
         LOGW("Failed to {} Art symbol {}", save ? "hook" : "unhook", symbol);
@@ -119,8 +119,9 @@ inline int UnhookArtFunction(void *original) {
     if (!dladdr(original, &info) || info.dli_sname != nullptr) return 1;
     if (!GetArt()->isStripped()) return UnhookFunction(original);
 
-    auto hook_iter = std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
-                                  [info](auto record) { return record.first == info.dli_sname; });
+    auto hook_iter =
+        std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
+                     [info](auto record) { return strcmp(record.first, info.dli_sname) == 0; });
     void *stub = nullptr;
     if (hook_iter != plt_hook_saved.end() &&
         HookArtFunction(original, *(hook_iter->second), &stub, false)) {
