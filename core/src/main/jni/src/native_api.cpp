@@ -28,7 +28,6 @@
 #include <sys/mman.h>
 #include <list>
 #include <dlfcn.h>
-#include "native_util.h"
 #include "elf_util.h"
 
 
@@ -59,8 +58,8 @@ namespace lspd {
     const auto[entries] = []() {
         auto *entries = new(protected_page.get()) NativeAPIEntries{
                 .version = 2,
-                .hookFunc = &HookFunction,
-                .unhookFunc = &UnhookFunction,
+                .hookFunc = &DobbyHookFunction,
+                .unhookFunc = &DobbyUnhookFunction,
         };
 
         mprotect(protected_page.get(), 4096, PROT_READ);
@@ -72,7 +71,7 @@ namespace lspd {
             return InstallNativeAPI({
                 .inline_hooker = [](auto t, auto r) {
                     void* bk = nullptr;
-                    return HookFunction(t, r, &bk) == 0 ? bk : nullptr;
+                    return DobbyHookFunction(t, r, &bk) == 0 ? bk : nullptr;
                 },
             });
         }();
