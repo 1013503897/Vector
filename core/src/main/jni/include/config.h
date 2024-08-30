@@ -31,7 +31,6 @@ namespace lspd {
 
 //#define LOG_DISABLED
 //#define DEBUG
-    using lsplant::operator""_tstr;
 
     inline bool constexpr Is64() {
 #if defined(__LP64__)
