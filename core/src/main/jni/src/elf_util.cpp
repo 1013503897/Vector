@@ -58,7 +58,7 @@ ElfImg::ElfImg(std::string_view base_name) : elf(base_name) {
 
     close(fd);
     parse(header);
-    if (debugdata_offset != 0 && debugdata_size != 0) {
+    if (isStripped()) {
         if (xzdecompress()) {
             header_debugdata = reinterpret_cast<ElfW(Ehdr) *>(elf_debugdata.data());
             parse(header_debugdata);

@@ -74,6 +74,10 @@ namespace SandHook {
             return base != nullptr;
         }
 
+        bool isStripped() const {
+            return debugdata_offset != 0 && debugdata_size != 0;
+        }
+
         const std::string name() const {
             return elf;
         }
