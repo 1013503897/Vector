@@ -52,7 +52,7 @@ namespace lspd {
 
     void RegisterNativeLib(const std::string &library_name);
 
-    inline int HookFunction(void *original, void *replace, void **backup) {
+    inline int HookInline(void *original, void *replace, void **backup) {
         if constexpr (isDebug) {
             Dl_info info;
             if (dladdr(original, &info))
@@ -64,7 +64,7 @@ namespace lspd {
         return DobbyHook(original, reinterpret_cast<dobby_dummy_func_t>(replace), reinterpret_cast<dobby_dummy_func_t *>(backup));
     }
 
-    inline int UnhookFunction(void *original) {
+    inline int UnhookInline(void *original) {
         if constexpr (isDebug) {
             Dl_info info;
             if (dladdr(original, &info))

@@ -58,8 +58,8 @@ namespace lspd {
     const auto[entries] = []() {
         auto *entries = new(protected_page.get()) NativeAPIEntries{
                 .version = 2,
-                .hookFunc = &HookFunction,
-                .unhookFunc = &UnhookFunction,
+                .hookFunc = &HookInline,
+                .unhookFunc = &UnhookInline,
         };
 
         mprotect(protected_page.get(), 4096, PROT_READ);
@@ -71,7 +71,7 @@ namespace lspd {
             return InstallNativeAPI(lsplant::InitInfo {
                 .inline_hooker = [](auto t, auto r) {
                     void* bk = nullptr;
-                    return HookFunction(t, r, &bk) == 0 ? bk : nullptr;
+                    return HookInline(t, r, &bk) == 0 ? bk : nullptr;
                 },
                 .art_symbol_resolver = [](auto symbol){
                    return GetLinker()->getSymbAddress(symbol);

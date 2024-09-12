@@ -80,7 +80,7 @@ static dev_t dev = 0;
 static ino_t inode = 0;
 static std::vector<std::pair<const char *, void **>> plt_hook_saved = {};
 
-inline int HookArtFunction(void *art_symbol, void *callback, void **backup, bool save = true) {
+inline int HookPLT(void *art_symbol, void *callback, void **backup, bool save = true) {
     auto symbol = reinterpret_cast<const char *>(art_symbol);
 
     if (GetArt()->isStripped()) {
@@ -106,25 +106,25 @@ inline int HookArtFunction(void *art_symbol, void *callback, void **backup, bool
     if (auto addr = GetArt()->getSymbAddress(symbol); addr) {
         Dl_info info;
         if (dladdr(addr, &info) && info.dli_sname != nullptr && strcmp(info.dli_sname, symbol) == 0)
-            HookFunction(addr, callback, backup);
+            HookInline(addr, callback, backup);
     } else if (*backup == nullptr && isDebug) {
         LOGW("Failed to {} Art symbol {}", save ? "hook" : "unhook", symbol);
     }
     return *backup == nullptr;
 }
 
-inline int UnhookArtFunction(void *original) {
+inline int UnhookPLT(void *original) {
     Dl_info info;
 
     if (!dladdr(original, &info) || info.dli_sname != nullptr) return 1;
-    if (!GetArt()->isStripped()) return UnhookFunction(original);
+    if (!GetArt()->isStripped()) return UnhookInline(original);
 
     auto hook_iter =
         std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
                      [info](auto record) { return strcmp(record.first, info.dli_sname) == 0; });
     void *stub = nullptr;
     if (hook_iter != plt_hook_saved.end() &&
-        HookArtFunction(original, *(hook_iter->second), &stub, false)) {
+        HookPLT(original, *(hook_iter->second), &stub, false)) {
         plt_hook_saved.erase(hook_iter);
         return 0;
     }
