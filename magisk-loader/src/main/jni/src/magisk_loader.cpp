@@ -123,19 +123,19 @@ void MagiskLoader::InitializeZygiskApi(zygisk::Api *api) {
     };
 
     auto UnhookPLT = [HookPLT, &plt_hook_saved](void *original) {
-        Dl_info info;
-
-        if (!dladdr(original, &info) || info.dli_sname != nullptr) return 1;
         if (!GetArt()->isStripped()) return UnhookInline(original);
 
+        auto symbol = reinterpret_cast<const char *>(original);
         auto hook_iter =
             std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
-                         [info](auto record) { return strcmp(record.first, info.dli_sname) == 0; });
+                         [symbol](auto record) { return strcmp(record.first, symbol) == 0; });
         void *stub = nullptr;
         if (hook_iter != plt_hook_saved.end() &&
             HookPLT(original, *(hook_iter->second), &stub, false)) {
             plt_hook_saved.erase(hook_iter);
             return 0;
+        } else {
+            return UnhookInline(original);
         }
         return 1;
     };
