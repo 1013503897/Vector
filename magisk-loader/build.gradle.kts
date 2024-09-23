@@ -203,7 +203,7 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
                 "updateJson" to "https://raw.githubusercontent.com/JingMatrix/LSPosed/master/magisk-loader/update/${flavorLowered}.json",
                 "requirement" to when (flavorLowered) {
                     "riru" -> "Requires Riru $moduleMinRiruVersionName or above installed"
-                    "zygisk" -> "Requires Magisk 24.0+ and Zygisk enabled"
+                    "zygisk" -> "Requires Magisk 26.0+ and Zygisk enabled"
                     else -> "No further requirements"
                 },
                 "api" to flavorCapped,

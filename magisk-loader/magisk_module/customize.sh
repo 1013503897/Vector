@@ -55,7 +55,9 @@ extract "$ZIPFILE" 'verify.sh' "$TMPDIR"
 extract "$ZIPFILE" 'util_functions.sh' "$TMPDIR"
 . "$TMPDIR/util_functions.sh"
 check_android_version
-check_magisk_version
+if [ -z "$KSU" ] && [ -z "$APATCH" ]; then
+  check_magisk_version
+fi
 check_incompatible_module
 
 if [ "$FLAVOR" == "riru" ]; then

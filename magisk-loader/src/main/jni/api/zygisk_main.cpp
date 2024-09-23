@@ -22,7 +22,7 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 
-#include "zygisk.h"
+#include "zygisk.hpp"
 #include "logging.h"
 #include "loader.h"
 #include "config_impl.h"

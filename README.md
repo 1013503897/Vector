@@ -14,12 +14,11 @@ Android 8.1 ~ 15 Beta 4
 
 ## Install
 
-1. Install Magisk v24+
-2. (For Riru flavor) Install [Riru](https://github.com/RikkaApps/Riru/releases/latest) v26.1.7+
-3. [Download](#download) and install LSPosed in Magisk app
-4. Reboot
-5. Open LSPosed manager from notification
-6. Have fun :)
+1. Install Magisk v26+
+2. [Download](#download) and install LSPosed in Magisk app
+3. Reboot
+4. Open LSPosed manager from notification
+5. Have fun :)
 
 ## Download
 

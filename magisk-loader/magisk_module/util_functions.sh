@@ -21,9 +21,9 @@
 check_magisk_version() {
   ui_print "- Magisk version: $MAGISK_VER_CODE"
   if [ "$FLAVOR" == "riru" ] || [ "$FLAVOR" == "zygisk" ]; then
-    if [ "$MAGISK_VER_CODE" -lt 24000 ]; then
+    if [ "$MAGISK_VER_CODE" -lt 26000 ]; then
       ui_print "*********************************************************"
-      ui_print "! Please install Magisk v24+"
+      ui_print "! Please install Magisk v26+"
       abort    "*********************************************************"
     fi
   else
