@@ -22,7 +22,6 @@
 #include <sys/mman.h>
 
 #include "elf_util.h"
-#include "lsplt.hpp"
 #include "symbol_cache.h"
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunused-value"

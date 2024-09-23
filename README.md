@@ -56,8 +56,7 @@ You can contribute translation [here](https://crowdin.com/project/lsposed_jingma
 
 - [Magisk](https://github.com/topjohnwu/Magisk/): makes all these possible
 - [XposedBridge](https://github.com/rovo89/XposedBridge): the OG Xposed framework APIs
-- [LSPlt](https://github.com/LSPosed/LSPlt): used for (Android 15) `libart` inline hooking
-- [Dobby](https://github.com/JingMatrix/Dobby): used for fallback and `native_api` inline hooking
+- [Dobby](https://github.com/JingMatrix/Dobby): fallback of PLT hook and inline hooker for `native_api` implement
 - [LSPlant](https://github.com/JingMatrix/LSPlant): the core ART hooking framework
 - [EdXposed](https://github.com/ElderDrivers/EdXposed): fork source
 - [xz-embedded](https://github.com/tukaani-project/xz-embedded): decompress `.gnu_debugdata` header section of stripped `libart.so`
