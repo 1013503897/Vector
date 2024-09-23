@@ -4,7 +4,7 @@
 
 ## Introduction 
 
-A Riru / Zygisk module trying to provide an ART hooking framework which delivers consistent APIs with the OG Xposed, leveraging LSPlant hooking framework.
+A Zygisk module trying to provide an ART hooking framework which delivers consistent APIs with the OG Xposed, leveraging LSPlant hooking framework.
 
 > Xposed is a framework for modules that can change the behavior of the system and apps without touching any APKs. That's great because it means that modules can work for different versions and even ROMs without any changes (as long as the original code was not changed too much). It's also easy to undo. As all changes are done in the memory, you just need to deactivate the module and reboot to get your original system back. There are many other advantages, but here is just one more: multiple modules can do changes to the same part of the system or app. With modified APKs, you have to choose one. No way to combine them, unless the author builds multiple APKs with different combinations.
 
@@ -55,13 +55,13 @@ You can contribute translation [here](https://crowdin.com/project/lsposed_jingma
 ## Credits 
 
 - [Magisk](https://github.com/topjohnwu/Magisk/): makes all these possible
-- [Riru](https://github.com/RikkaApps/Riru): provides a way to inject code into zygote process
 - [XposedBridge](https://github.com/rovo89/XposedBridge): the OG Xposed framework APIs
 - [LSPlt](https://github.com/LSPosed/LSPlt): used for (Android 15) `libart` inline hooking
 - [Dobby](https://github.com/JingMatrix/Dobby): used for fallback and `native_api` inline hooking
 - [LSPlant](https://github.com/JingMatrix/LSPlant): the core ART hooking framework
 - [EdXposed](https://github.com/ElderDrivers/EdXposed): fork source
 - [xz-embedded](https://github.com/tukaani-project/xz-embedded): decompress `.gnu_debugdata` header section of stripped `libart.so`
+- ~~[Riru](https://github.com/RikkaApps/Riru): provides a way to inject code into zygote process~~
 - ~[SandHook](https://github.com/ganyao114/SandHook/): ART hooking framework for SandHook variant~
 - ~[YAHFA](https://github.com/rk700/YAHFA): previous ART hooking framework~
 - ~[dexmaker](https://github.com/linkedin/dexmaker) and [dalvikdx](https://github.com/JakeWharton/dalvik-dx): to dynamically generate YAHFA hooker classes~
