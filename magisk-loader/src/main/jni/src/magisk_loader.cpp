@@ -23,11 +23,15 @@
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <sys/mman.h>
+#include <sys/sysmacros.h>
 
+#include <algorithm>
+#include <cinttypes>
+
+#include "../src/native_api.h"
 #include "config_impl.h"
 #include "elf_util.h"
 #include "loader.h"
-#include "native_util.h"
 #include "service.h"
 #include "symbol_cache.h"
 #include "utils/jni_helper.hpp"
@@ -49,6 +53,105 @@ constexpr int PER_USER_RANGE = 100000;
 
 static constexpr uid_t kAidInjected = INJECTED_AID;
 static constexpr uid_t kAidInet = 3003;
+
+std::vector<MapInfo> MapInfo::Scan(std::string_view pid) {
+    constexpr static auto kPermLength = 5;
+    constexpr static auto kMapEntry = 7;
+    std::vector<MapInfo> info;
+    auto path = "/proc/" + std::string{pid} + "/maps";
+    auto maps = std::unique_ptr<FILE, decltype(&fclose)>{fopen(path.c_str(), "r"), &fclose};
+    if (maps) {
+        char *line = nullptr;
+        size_t len = 0;
+        ssize_t read;
+        while ((read = getline(&line, &len, maps.get())) > 0) {
+            line[read - 1] = '\0';
+            uintptr_t start = 0;
+            uintptr_t end = 0;
+            uintptr_t off = 0;
+            ino_t inode = 0;
+            unsigned int dev_major = 0;
+            unsigned int dev_minor = 0;
+            std::array<char, kPermLength> perm{'\0'};
+            int path_off;
+            if (sscanf(line, "%" PRIxPTR "-%" PRIxPTR " %4s %" PRIxPTR " %x:%x %lu %n%*s", &start,
+                       &end, perm.data(), &off, &dev_major, &dev_minor, &inode,
+                       &path_off) != kMapEntry) {
+                continue;
+            }
+            while (path_off < read && isspace(line[path_off])) path_off++;
+            auto &ref = info.emplace_back(MapInfo{start, end, 0, perm[3] == 'p', off,
+                                                  static_cast<dev_t>(makedev(dev_major, dev_minor)),
+                                                  inode, line + path_off});
+            if (perm[0] == 'r') ref.perms |= PROT_READ;
+            if (perm[1] == 'w') ref.perms |= PROT_WRITE;
+            if (perm[2] == 'x') ref.perms |= PROT_EXEC;
+        }
+        free(line);
+    }
+    return info;
+}
+
+void MagiskLoader::InitializeZygiskApi(zygisk::Api *api) {
+    std::vector<std::pair<const char *, void **>> plt_hook_saved = {};
+
+    const std::string libArtPath = GetArt()->name();
+    const auto maps = MapInfo::Scan();
+    const auto libArtMap = std::find_if(maps.begin(), maps.end(),
+                                        [libArtPath](auto it) { return it.path == libArtPath; });
+    const dev_t dev = libArtMap->inode;
+    const ino_t inode = libArtMap->dev;
+
+    auto HookPLT = [dev, inode, &plt_hook_saved, api](void *art_symbol, void *callback,
+                                                      void **backup, bool save = true) {
+        auto symbol = reinterpret_cast<const char *>(art_symbol);
+
+        if (GetArt()->isStripped()) {
+            api->pltHookRegister(dev, inode, symbol, callback, backup);
+            if (api->pltHookCommit() && *backup != nullptr) {
+                if (save) plt_hook_saved.emplace_back(symbol, backup);
+                return 0;
+            }
+        }
+
+        if (auto addr = GetArt()->getSymbAddress(symbol); addr) {
+            HookInline(addr, callback, backup);
+        } else if (*backup == nullptr && isDebug) {
+            LOGW("Failed to {} Art symbol {}", save ? "hook" : "unhook", symbol);
+        }
+        return (int)(*backup == nullptr);
+    };
+
+    auto UnhookPLT = [HookPLT, &plt_hook_saved](void *original) {
+        Dl_info info;
+
+        if (!dladdr(original, &info) || info.dli_sname != nullptr) return 1;
+        if (!GetArt()->isStripped()) return UnhookInline(original);
+
+        auto hook_iter =
+            std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
+                         [info](auto record) { return strcmp(record.first, info.dli_sname) == 0; });
+        void *stub = nullptr;
+        if (hook_iter != plt_hook_saved.end() &&
+            HookPLT(original, *(hook_iter->second), &stub, false)) {
+            plt_hook_saved.erase(hook_iter);
+            return 0;
+        }
+        return 1;
+    };
+
+    initInfo = lsplant::InitInfo{
+        .inline_hooker =
+            [HookPLT](auto t, auto r) {
+                void *bk = nullptr;
+                return HookPLT(t, r, &bk) == 0 ? bk : nullptr;
+            },
+        .inline_unhooker = [UnhookPLT](auto t) { return UnhookPLT(t) == 0; },
+        .art_symbol_resolver = [](auto symbol) { return GetArt()->getSymbAddress(symbol); },
+        .art_symbol_prefix_resolver =
+            [](auto symbol) { return GetArt()->getSymbPrefixFirstAddress(symbol); },
+        .is_plt_hook = true};
+}
 
 void MagiskLoader::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
     auto classloader = JNI_FindClass(env, "java/lang/ClassLoader");
@@ -115,17 +218,6 @@ void MagiskLoader::OnNativeForkSystemServerPost(JNIEnv *env) {
         instance->HookBridge(*this, env);
 
         // always inject into system server
-        lsplant::InitInfo initInfo{
-            .inline_hooker =
-                [](auto t, auto r) {
-                    void *bk = nullptr;
-                    return HookPLT(t, r, &bk) == 0 ? bk : nullptr;
-                },
-            .inline_unhooker = [](auto t) { return UnhookPLT(t) == 0; },
-            .art_symbol_resolver = [](auto symbol) { return GetArt()->getSymbAddress(symbol); },
-            .art_symbol_prefix_resolver =
-                [](auto symbol) { return GetArt()->getSymbPrefixFirstAddress(symbol); },
-            .is_plt_hook = true};
         InitArtHooker(env, initInfo);
         InitHooks(env);
         SetupEntryClass(env);
@@ -187,17 +279,6 @@ void MagiskLoader::OnNativeForkAndSpecializePost(JNIEnv *env, jstring nice_name,
     auto binder =
         skip_ ? ScopedLocalRef<jobject>{env, nullptr} : instance->RequestBinder(env, nice_name);
     if (binder) {
-        lsplant::InitInfo initInfo{
-            .inline_hooker =
-                [](auto t, auto r) {
-                    void *bk = nullptr;
-                    return HookPLT(t, r, &bk) == 0 ? bk : nullptr;
-                },
-            .inline_unhooker = [](auto t) { return UnhookPLT(t) == 0; },
-            .art_symbol_resolver = [](auto symbol) { return GetArt()->getSymbAddress(symbol); },
-            .art_symbol_prefix_resolver =
-                [](auto symbol) { return GetArt()->getSymbPrefixFirstAddress(symbol); },
-            .is_plt_hook = true};
         auto [dex_fd, size] = instance->RequestLSPDex(env, binder);
         auto obfs_map = instance->RequestObfuscationMap(env, binder);
         ConfigBridge::GetInstance()->obfuscation_map(std::move(obfs_map));

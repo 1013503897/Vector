@@ -76,59 +76,6 @@ inline bool RegisterNativeMethodsInternal(JNIEnv *env, std::string_view class_na
     RegisterNativeMethodsInternal(env, GetNativeBridgeSignature() + #class_name, gMethods,         \
                                   arraysize(gMethods))
 
-static dev_t dev = 0;
-static ino_t inode = 0;
-static std::vector<std::pair<const char *, void **>> plt_hook_saved = {};
-
-inline int HookPLT(void *art_symbol, void *callback, void **backup, bool save = true) {
-    auto symbol = reinterpret_cast<const char *>(art_symbol);
-
-    if (GetArt()->isStripped()) {
-        if (dev == 0 || inode == 0) {
-            auto libart_path = GetArt()->name();
-            for (auto map : lsplt::MapInfo::Scan()) {
-                if (map.path == libart_path) {
-                    inode = map.inode;
-                    dev = map.dev;
-                    break;
-                }
-            }
-        }
-
-        auto result =
-            lsplt::RegisterHook(dev, inode, symbol, callback, backup) && lsplt::CommitHook();
-        if (result && *backup != nullptr) {
-            if (save) plt_hook_saved.emplace_back(symbol, backup);
-            return 0;
-        }
-    }
-
-    if (auto addr = GetArt()->getSymbAddress(symbol); addr) {
-        HookInline(addr, callback, backup);
-    } else if (*backup == nullptr && isDebug) {
-        LOGW("Failed to {} Art symbol {}", save ? "hook" : "unhook", symbol);
-    }
-    return *backup == nullptr;
-}
-
-inline int UnhookPLT(void *original) {
-    Dl_info info;
-
-    if (!dladdr(original, &info) || info.dli_sname != nullptr) return 1;
-    if (!GetArt()->isStripped()) return UnhookInline(original);
-
-    auto hook_iter =
-        std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
-                     [info](auto record) { return strcmp(record.first, info.dli_sname) == 0; });
-    void *stub = nullptr;
-    if (hook_iter != plt_hook_saved.end() &&
-        HookPLT(original, *(hook_iter->second), &stub, false)) {
-        plt_hook_saved.erase(hook_iter);
-        return 0;
-    }
-    return 1;
-}
-
 inline std::string GetNativeBridgeSignature() {
     const auto &obfs_map = ConfigBridge::GetInstance()->obfuscation_map();
     static auto signature = obfs_map.at("org.lsposed.lspd.nativebridge.");
