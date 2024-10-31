@@ -14,3 +14,25 @@ java {
         }
     }
 }
+
+val lang3Src = "commons-lang/src/main/java/org/apache/commons/lang3"
+val localDir = "local/generated"
+
+task<Copy>("ClassUtilsX") {
+    from("$lang3Src/ClassUtils.java")
+    into(localDir)
+    filter { line: String -> line.replace("ClassUtils", "ClassUtilsX") }
+    rename("(.+).java", "$1X.java")
+}
+
+task<Copy>("SerializationUtilsX") {
+    from("$lang3Src/SerializationUtils.java")
+    into(localDir)
+    filter { line: String -> line.replace("SerializationUtils", "SerializationUtilsX") }
+    rename("(.+).java", "$1X.java")
+}
+
+tasks.compileJava {
+    dependsOn("ClassUtilsX")
+    dependsOn("SerializationUtilsX")
+}

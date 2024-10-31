@@ -26,7 +26,7 @@ import android.content.res.Resources;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import org.apache.commons.lang3.ClassUtils;
+import org.apache.commons.lang3.ClassUtilsX;
 import org.apache.commons.lang3.reflect.MemberUtilsX;
 
 import java.io.ByteArrayOutputStream;
@@ -202,7 +202,7 @@ public final class XposedHelpers {
         if (classLoader == null)
             classLoader = XposedBridge.BOOTCLASSLOADER;
         try {
-            return ClassUtils.getClass(classLoader, className, false);
+            return ClassUtilsX.getClass(classLoader, className, false);
         } catch (ClassNotFoundException e) {
             throw new ClassNotFoundError(e);
         }
@@ -540,7 +540,7 @@ public final class XposedHelpers {
                         continue;
 
                     // compare name and parameters
-                    if (method.getName().equals(k.name) && ClassUtils.isAssignable(
+                    if (method.getName().equals(k.name) && ClassUtilsX.isAssignable(
                             k.parameters,
                             method.getParameterTypes(),
                             true)) {
@@ -763,7 +763,7 @@ public final class XposedHelpers {
             Constructor<?>[] constructors = k.clazz.getDeclaredConstructors();
             for (Constructor<?> constructor : constructors) {
                 // compare name and parameters
-                if (ClassUtils.isAssignable(
+                if (ClassUtilsX.isAssignable(
                         k.parameters,
                         constructor.getParameterTypes(),
                         true)) {

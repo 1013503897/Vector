@@ -51,7 +51,7 @@ import android.util.Pair;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
-import org.apache.commons.lang3.SerializationUtils;
+import org.apache.commons.lang3.SerializationUtilsX;
 import org.lsposed.daemon.BuildConfig;
 import org.lsposed.lspd.models.Application;
 import org.lsposed.lspd.models.Module;
@@ -464,7 +464,7 @@ public class ConfigManager {
                 var group = cursor.getString(groupIdx);
                 var key = cursor.getString(keyIdx);
                 var data = cursor.getBlob(dataIdx);
-                var object = SerializationUtils.deserialize(data);
+                var object = SerializationUtilsX.deserialize(data);
                 if (object == null) continue;
                 config.computeIfAbsent(group, g -> new HashMap<>()).put(key, object);
             }
@@ -491,7 +491,7 @@ public class ConfigManager {
                         var contents = new ContentValues();
                         contents.put("`group`", group);
                         contents.put("`key`", key);
-                        contents.put("data", SerializationUtils.serialize((Serializable) value));
+                        contents.put("data", SerializationUtilsX.serialize((Serializable) value));
                         contents.put("module_pkg_name", moduleName);
                         contents.put("user_id", String.valueOf(userId));
                         db.insertWithOnConflict("configs", null, contents, SQLiteDatabase.CONFLICT_REPLACE);
