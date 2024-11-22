@@ -41,6 +41,7 @@ import com.android.internal.os.BinderInternal;
 import org.lsposed.daemon.BuildConfig;
 
 import java.io.File;
+import java.lang.Class;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -151,6 +152,9 @@ public class ServiceManager {
 
         ConfigFileManager.reloadConfiguration();
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM)
+            notificationWorkaround();
+
         BridgeService.send(mainService, new BridgeService.Listener() {
             @Override
             public void onSystemServerRestarted() {
@@ -234,6 +238,18 @@ public class ServiceManager {
             sCache.put("appops", new BinderProxy("appops"));
         } catch (Throwable e) {
             Log.e(TAG, "failed to init permission manager", e);
+        }
+    }
+
+    private static void notificationWorkaround() {
+        try {
+            Class feature = Class.forName("android.app.FeatureFlagsImpl");
+            Field systemui_is_cached = feature.getDeclaredField("systemui_is_cached");
+            systemui_is_cached.setAccessible(true);
+            systemui_is_cached.set(null, true);
+            Log.d(TAG, "set flag systemui_is_cached to true");
+        } catch (Throwable e) {
+            Log.e(TAG, "failed to change feature flags", e);
         }
     }
 
