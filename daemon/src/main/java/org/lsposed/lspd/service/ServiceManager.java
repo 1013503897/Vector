@@ -20,6 +20,7 @@
 package org.lsposed.lspd.service;
 
 import android.app.ActivityThread;
+import android.app.Notification;
 import android.content.Context;
 import android.ddm.DdmHandleAppName;
 import android.os.Binder;
@@ -39,8 +40,10 @@ import androidx.annotation.RequiresApi;
 import com.android.internal.os.BinderInternal;
 
 import org.lsposed.daemon.BuildConfig;
+import org.lsposed.lspd.util.FakeContext;
 
 import java.io.File;
+import java.lang.AbstractMethodError;
 import java.lang.Class;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
@@ -152,8 +155,7 @@ public class ServiceManager {
 
         ConfigFileManager.reloadConfiguration();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM)
-            notificationWorkaround();
+        notificationWorkaround();
 
         BridgeService.send(mainService, new BridgeService.Listener() {
             @Override
@@ -242,15 +244,26 @@ public class ServiceManager {
     }
 
     private static void notificationWorkaround() {
-        try {
-            Class feature = Class.forName("android.app.FeatureFlagsImpl");
-            Field systemui_is_cached = feature.getDeclaredField("systemui_is_cached");
-            systemui_is_cached.setAccessible(true);
-            systemui_is_cached.set(null, true);
-            Log.d(TAG, "set flag systemui_is_cached to true");
-        } catch (Throwable e) {
-            Log.e(TAG, "failed to change feature flags", e);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            try {
+                Class feature = Class.forName("android.app.FeatureFlagsImpl");
+                Field systemui_is_cached = feature.getDeclaredField("systemui_is_cached");
+                systemui_is_cached.setAccessible(true);
+                systemui_is_cached.set(null, true);
+                Log.d(TAG, "set flag systemui_is_cached to true");
+            } catch (Throwable e) {
+                Log.e(TAG, "failed to change feature flags", e);
+            }
         }
+
+        try {
+            new Notification.Builder(new FakeContext(), "notification_workaround").build();
+        } catch (AbstractMethodError e) {
+            FakeContext.nullProvider = ! FakeContext.nullProvider;
+        } catch (Throwable e) {
+            Log.e(TAG, "failed to build notifications", e);
+        }
+
     }
 
     private static class BinderProxy extends Binder {

@@ -21,6 +21,9 @@ import hidden.HiddenApiBridge;
 public class FakeContext extends ContextWrapper {
     static ApplicationInfo systemApplicationInfo = null;
     static Resources.Theme theme = null;
+
+    public static Boolean nullProvider = false;
+
     private String packageName = "android";
     public FakeContext() {
         super(null);
@@ -59,8 +62,11 @@ public class FakeContext extends ContextWrapper {
 
     @Override
     public ContentResolver getContentResolver() {
-        return new ContentResolver(this) {
-        };
+        if (nullProvider) {
+            return null;
+        } else {
+            return new ContentResolver(this) {};
+        }
     }
 
     public int getUserId() {
