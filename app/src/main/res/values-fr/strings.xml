@@ -169,7 +169,7 @@ JingMatrix</string>
     <!-- SettingsActivity -->
     <string name="settings_group_framework">Sous-système</string>
     <string name="settings_disable_verbose_log">Désactiver les journaux détaillés</string>
-    <string name="settings_disable_verbose_log_summary">Demande de rapports sur les problèmes pour inclure les journaux détaillés</string>
+    <string name="settings_disable_verbose_log_summary">Les journaux détaillés sont requis pour signaler des problèmes</string>
     <string name="settings_enable_log_watchdog">Activer le chien de garde de journal</string>
     <string name="settings_enable_log_watchdog_summary">Le chien de garde du journal LSPosed modifie les propriétés du système, qui peuvent être exploitées pour détecter LSPosed</string>
     <string name="pure_black_dark_theme">Thème noir et sombre</string>
