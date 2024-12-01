@@ -29,10 +29,7 @@
 namespace lspd {
 class MagiskLoader : public Context {
 public:
-    inline static void Init(zygisk::Api *api) {
-        instance_ = std::make_unique<MagiskLoader>();
-        GetInstance()->InitializeZygiskApi(api);
-    }
+    inline static void Init() { instance_ = std::make_unique<MagiskLoader>(); }
 
     inline static MagiskLoader *GetInstance() {
         return static_cast<MagiskLoader *>(instance_.get());
@@ -41,11 +38,12 @@ public:
     void OnNativeForkAndSpecializePre(JNIEnv *env, jint uid, jintArray &gids, jstring &nice_name,
                                       jboolean is_child_zygote, jstring app_data_dir);
 
-    void OnNativeForkAndSpecializePost(JNIEnv *env, jstring nice_name, jstring app_dir);
-
-    void OnNativeForkSystemServerPost(JNIEnv *env);
+    void OnNativeForkAndSpecializePost(JNIEnv *env, zygisk::Api *api, jstring nice_name,
+                                       jstring app_dir);
 
     void OnNativeForkSystemServerPre(JNIEnv *env);
+
+    void OnNativeForkSystemServerPost(JNIEnv *env, zygisk::Api *api);
 
 protected:
     void LoadDex(JNIEnv *env, PreloadedDex &&dex) override;
@@ -54,9 +52,10 @@ protected:
 
 private:
     bool skip_ = false;
+    bool lsplant_initilized = false;
     lsplant::InitInfo initInfo;
 
-    void InitializeZygiskApi(zygisk::Api *api);
+    void InitializeLSPlant(zygisk::Api *api);
     static void setAllowUnload(bool unload);
 };
 

@@ -40,7 +40,7 @@ class ZygiskModule : public zygisk::ModuleBase {
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         env_ = env;
         api_ = api;
-        MagiskLoader::Init(api);
+        MagiskLoader::Init();
         ConfigImpl::Init();
     }
 
@@ -51,7 +51,7 @@ class ZygiskModule : public zygisk::ModuleBase {
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        MagiskLoader::GetInstance()->OnNativeForkAndSpecializePost(env_, args->nice_name,
+        MagiskLoader::GetInstance()->OnNativeForkAndSpecializePost(env_, api_, args->nice_name,
                                                                    args->app_data_dir);
         if (*allowUnload) api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
@@ -69,7 +69,7 @@ class ZygiskModule : public zygisk::ModuleBase {
             env_->DeleteLocalRef(name);
             env_->DeleteLocalRef(process);
         }
-        MagiskLoader::GetInstance()->OnNativeForkSystemServerPost(env_);
+        MagiskLoader::GetInstance()->OnNativeForkSystemServerPost(env_, api_);
         if (*allowUnload) api_->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
     }
 };
