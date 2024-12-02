@@ -248,7 +248,6 @@ namespace lspd {
         auto &binder = lspd::GetLibBinder(false);
         IPCThreadState::Init(binder.get());
         lspd::GetLibBinder(true);
-        lspd::GetArt(true);
 
         LOGD("Done InitService");
     }
