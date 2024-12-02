@@ -23,6 +23,8 @@ if [ $debug = "true" ]; then
   fi
 fi
 
+mount tmpfs -t tmpfs /data/resource-cache
+
 if [ ! -S "/dev/socket/zygote" ]; then
   timeout 0.5 inotifyd - /dev/socket:near | while read -r line; do
     $debug && log -p v -t "LSPosed" "inotify: $line"
