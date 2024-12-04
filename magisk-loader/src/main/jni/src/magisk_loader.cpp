@@ -101,8 +101,8 @@ void MagiskLoader::InitializeLSPlant(zygisk::Api *api) {
     const auto maps = MapInfo::Scan();
     const auto libArtMap = std::find_if(maps.begin(), maps.end(),
                                         [libArtPath](auto it) { return it.path == libArtPath; });
-    const dev_t dev = libArtMap->inode;
-    const ino_t inode = libArtMap->dev;
+    const dev_t dev = libArtMap->dev;
+    const ino_t inode = libArtMap->inode;
 
     auto HookPLT = [dev, inode, &plt_hook_saved, api](void *art_symbol, void *callback,
                                                       void **backup, bool save = true) {
@@ -112,6 +112,7 @@ void MagiskLoader::InitializeLSPlant(zygisk::Api *api) {
             api->pltHookRegister(dev, inode, symbol, callback, backup);
             if (api->pltHookCommit() && *backup != nullptr) {
                 if (save) plt_hook_saved.emplace_back(symbol, backup);
+                LOGD("pltHook of {} finished", symbol);
                 return 0;
             }
         }
