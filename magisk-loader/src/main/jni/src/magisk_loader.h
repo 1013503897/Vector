@@ -23,8 +23,10 @@
 
 #pragma once
 
-#include "../api/zygisk.hpp"
+#include "../src/native_api.h"
 #include "context.h"
+#include "elf_util.h"
+#include "symbol_cache.h"
 
 namespace lspd {
 class MagiskLoader : public Context {
@@ -38,12 +40,11 @@ public:
     void OnNativeForkAndSpecializePre(JNIEnv *env, jint uid, jintArray &gids, jstring &nice_name,
                                       jboolean is_child_zygote, jstring app_data_dir);
 
-    void OnNativeForkAndSpecializePost(JNIEnv *env, zygisk::Api *api, jstring nice_name,
-                                       jstring app_dir);
+    void OnNativeForkAndSpecializePost(JNIEnv *env, jstring nice_name, jstring app_dir);
 
     void OnNativeForkSystemServerPre(JNIEnv *env);
 
-    void OnNativeForkSystemServerPost(JNIEnv *env, zygisk::Api *api);
+    void OnNativeForkSystemServerPost(JNIEnv *env);
 
 protected:
     void LoadDex(JNIEnv *env, PreloadedDex &&dex) override;
@@ -52,10 +53,18 @@ protected:
 
 private:
     bool skip_ = false;
-    bool lsplant_initilized = false;
-    lsplant::InitInfo initInfo;
+    const lsplant::InitInfo initInfo = lsplant::InitInfo{
+        .inline_hooker =
+            [](auto t, auto r) {
+                void *bk = nullptr;
+                return HookInline(t, r, &bk) == 0 ? bk : nullptr;
+            },
+        .inline_unhooker = [](auto t) { return UnhookInline(t) == 0; },
+        .art_symbol_resolver = [](auto symbol) { return GetArt()->getSymbAddress(symbol); },
+        .art_symbol_prefix_resolver =
+            [](auto symbol) { return GetArt()->getSymbPrefixFirstAddress(symbol); },
+        .is_plt_hook = true};
 
-    void InitializeLSPlant(zygisk::Api *api);
     static void setAllowUnload(bool unload);
 };
 

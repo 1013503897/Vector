@@ -25,13 +25,9 @@
 #include <sys/mman.h>
 #include <sys/sysmacros.h>
 
-#include <algorithm>
 #include <cinttypes>
 
-#include "../src/native_api.h"
 #include "config_impl.h"
-#include "elf_util.h"
-#include "loader.h"
 #include "service.h"
 #include "symbol_cache.h"
 #include "utils/jni_helper.hpp"
@@ -93,70 +89,6 @@ std::vector<MapInfo> MapInfo::Scan(std::string_view pid) {
     return info;
 }
 
-void MagiskLoader::InitializeLSPlant(zygisk::Api *api) {
-    if (lsplant_initilized) return;
-    std::vector<std::pair<const char *, void **>> plt_hook_saved = {};
-
-    const std::string libArtPath = GetArt()->name();
-    const auto maps = MapInfo::Scan();
-    const auto libArtMap = std::find_if(maps.begin(), maps.end(),
-                                        [libArtPath](auto it) { return it.path == libArtPath; });
-    const dev_t dev = libArtMap->dev;
-    const ino_t inode = libArtMap->inode;
-
-    auto HookPLT = [dev, inode, &plt_hook_saved, api](void *art_symbol, void *callback,
-                                                      void **backup, bool save = true) {
-        auto symbol = reinterpret_cast<const char *>(art_symbol);
-
-        if (GetArt()->isStripped()) {
-            api->pltHookRegister(dev, inode, symbol, callback, backup);
-            if (api->pltHookCommit() && *backup != nullptr) {
-                if (save) plt_hook_saved.emplace_back(symbol, backup);
-                LOGD("pltHook of {} finished", symbol);
-                return 0;
-            }
-        }
-
-        if (auto addr = GetArt()->getSymbAddress(symbol); addr) {
-            HookInline(addr, callback, backup);
-        } else if (*backup == nullptr && isDebug) {
-            LOGW("Failed to {} Art symbol {}", save ? "hook" : "unhook", symbol);
-        }
-        return (int)(*backup == nullptr);
-    };
-
-    auto UnhookPLT = [HookPLT, &plt_hook_saved](void *original) {
-        if (!GetArt()->isStripped()) return UnhookInline(original);
-
-        auto symbol = reinterpret_cast<const char *>(original);
-        auto hook_iter =
-            std::find_if(plt_hook_saved.begin(), plt_hook_saved.end(),
-                         [symbol](auto record) { return strcmp(record.first, symbol) == 0; });
-        void *stub = nullptr;
-        if (hook_iter != plt_hook_saved.end() &&
-            HookPLT(original, *(hook_iter->second), &stub, false)) {
-            plt_hook_saved.erase(hook_iter);
-            return 0;
-        } else {
-            return UnhookInline(original);
-        }
-        return 1;
-    };
-
-    initInfo = lsplant::InitInfo{
-        .inline_hooker =
-            [HookPLT](auto t, auto r) {
-                void *bk = nullptr;
-                return HookPLT(t, r, &bk) == 0 ? bk : nullptr;
-            },
-        .inline_unhooker = [UnhookPLT](auto t) { return UnhookPLT(t) == 0; },
-        .art_symbol_resolver = [](auto symbol) { return GetArt()->getSymbAddress(symbol); },
-        .art_symbol_prefix_resolver =
-            [](auto symbol) { return GetArt()->getSymbPrefixFirstAddress(symbol); },
-        .is_plt_hook = true};
-    lsplant_initilized = true;
-}
-
 void MagiskLoader::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
     auto classloader = JNI_FindClass(env, "java/lang/ClassLoader");
     auto getsyscl_mid = JNI_GetStaticMethodID(env, classloader, "getSystemClassLoader",
@@ -199,7 +131,7 @@ void MagiskLoader::OnNativeForkSystemServerPre(JNIEnv *env) {
     setAllowUnload(skip_);
 }
 
-void MagiskLoader::OnNativeForkSystemServerPost(JNIEnv *env, zygisk::Api *api) {
+void MagiskLoader::OnNativeForkSystemServerPost(JNIEnv *env) {
     if (!skip_) {
         auto *instance = Service::instance();
         auto system_server_binder = instance->RequestSystemServerBinder(env);
@@ -222,7 +154,6 @@ void MagiskLoader::OnNativeForkSystemServerPost(JNIEnv *env, zygisk::Api *api) {
         instance->HookBridge(*this, env);
 
         // always inject into system server
-        InitializeLSPlant(api);
         InitArtHooker(env, initInfo);
         InitHooks(env);
         SetupEntryClass(env);
@@ -277,8 +208,7 @@ void MagiskLoader::OnNativeForkAndSpecializePre(JNIEnv *env, jint uid, jintArray
     setAllowUnload(skip_);
 }
 
-void MagiskLoader::OnNativeForkAndSpecializePost(JNIEnv *env, zygisk::Api *api, jstring nice_name,
-                                                 jstring app_dir) {
+void MagiskLoader::OnNativeForkAndSpecializePost(JNIEnv *env, jstring nice_name, jstring app_dir) {
     const JUTFString process_name(env, nice_name);
     auto *instance = Service::instance();
     if (is_parasitic_manager) nice_name = JNI_NewStringUTF(env, "org.lsposed.manager").release();
@@ -290,7 +220,6 @@ void MagiskLoader::OnNativeForkAndSpecializePost(JNIEnv *env, zygisk::Api *api, 
         ConfigBridge::GetInstance()->obfuscation_map(std::move(obfs_map));
         LoadDex(env, PreloadedDex(dex_fd, size));
         close(dex_fd);
-        InitializeLSPlant(api);
         InitArtHooker(env, initInfo);
         InitHooks(env);
         SetupEntryClass(env);
