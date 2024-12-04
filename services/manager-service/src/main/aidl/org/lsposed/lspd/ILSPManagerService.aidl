@@ -91,4 +91,8 @@ interface ILSPManagerService {
     void setLogWatchdog(boolean enable) = 49;
 
     boolean isLogWatchdogEnabled() = 50;
+
+    boolean getAutoInclude(String packageName) = 51;
+
+    boolean setAutoInclude(String packageName, boolean enable) = 52;
 }
