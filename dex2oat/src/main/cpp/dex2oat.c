@@ -114,9 +114,13 @@ int main(int argc, char **argv) {
     new_argv[argc + 1] = NULL;
 
     if (getenv("LD_LIBRARY_PATH") == NULL) {
+#if defined(__LP64__)
         char const *libenv =
-            "LD_LIBRARY_PATH=/apex/com.android.art/lib64:/apex/com.android.art/lib"
-            ":/apex/com.android.os.statsd/lib64:/apex/com.android.os.statsd/lib";
+            "LD_LIBRARY_PATH=/apex/com.android.art/lib64:/apex/com.android.os.statsd/lib64";
+#else
+        char const *libenv =
+            "LD_LIBRARY_PATH=/apex/com.android.art/lib:/apex/com.android.os.statsd/lib";
+#endif
         putenv((char *)libenv);
     }
     fexecve(stock_fd, (char **)new_argv, environ);
