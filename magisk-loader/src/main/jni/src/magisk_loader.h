@@ -63,7 +63,7 @@ private:
         .art_symbol_resolver = [](auto symbol) { return GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
             [](auto symbol) { return GetArt()->getSymbPrefixFirstAddress(symbol); },
-        .is_plt_hook = true};
+    };
 
     static void setAllowUnload(bool unload);
 };
