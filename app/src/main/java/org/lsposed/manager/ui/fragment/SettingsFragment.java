@@ -156,15 +156,17 @@ public class SettingsFragment extends BaseFragment {
             MaterialSwitchPreference prefVerboseLogs = findPreference("disable_verbose_log");
             if (prefVerboseLogs != null) {
                 prefVerboseLogs.setEnabled(!BuildConfig.DEBUG && installed);
+                if (BuildConfig.DEBUG) ConfigManager.setVerboseLogEnabled(false);
                 prefVerboseLogs.setChecked(!installed || !ConfigManager.isVerboseLogEnabled());
                 prefVerboseLogs.setOnPreferenceChangeListener((preference, newValue) -> ConfigManager.setVerboseLogEnabled(!(boolean) newValue));
             }
 
-            MaterialSwitchPreference prefEnableLog = findPreference("enable_log_watchdog");
-            if (prefEnableLog != null) {
-                prefEnableLog.setEnabled(!BuildConfig.DEBUG && installed);
-                prefEnableLog.setChecked(!installed || ConfigManager.isLogWatchdogEnabled());
-                prefEnableLog.setOnPreferenceChangeListener((preference, newValue) -> ConfigManager.setLogWatchdog((boolean) newValue));
+            MaterialSwitchPreference prefLogWatchDog = findPreference("enable_log_watchdog");
+            if (prefLogWatchDog != null) {
+                prefLogWatchDog.setEnabled(!BuildConfig.DEBUG && installed);
+                if (BuildConfig.DEBUG) ConfigManager.setLogWatchdog(true);
+                prefLogWatchDog.setChecked(!installed || ConfigManager.isLogWatchdogEnabled());
+                prefLogWatchDog.setOnPreferenceChangeListener((preference, newValue) -> ConfigManager.setLogWatchdog((boolean) newValue));
             }
 
             MaterialSwitchPreference prefDexObfuscate = findPreference("enable_dex_obfuscate");
