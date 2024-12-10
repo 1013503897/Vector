@@ -139,9 +139,13 @@
     <string name="menu_show_denylist">Denylist</string>
     <string name="failed_to_save_scope_list">スコープリストの保存に失敗しました</string>
     <string name="app_version">バージョン: %1$s</string>
+    <string name="menu_select">選択</string>
     <string name="use_recommended">おすすめ</string>
     <string name="no_scope_selected_has_recommended">アプリが選択されていません。おすすめのアプリを選択しますか？</string>
     <string name="use_recommended_message">おすすめのアプリを選択しますか？</string>
+    <string name="menu_select_all">すべて</string>
+    <string name="menu_select_none">なし</string>
+    <string name="menu_auto_include">自動的に含む</string>
     <string name="module_is_not_activated_yet">Xposedモジュールが有効化されていません</string>
     <string name="requested_by_module">おすすめ</string>
     <string name="update_available">アップデートが利用可能です: %1$s</string>
