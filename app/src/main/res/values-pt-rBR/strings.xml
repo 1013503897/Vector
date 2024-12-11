@@ -141,9 +141,13 @@
     <string name="menu_show_denylist">Lista de negação</string>
     <string name="failed_to_save_scope_list">Falha ao salvar lista de escopos</string>
     <string name="app_version">Versão: %1$s</string>
+    <string name="menu_select">Selecionar</string>
     <string name="use_recommended">Recomendações</string>
     <string name="no_scope_selected_has_recommended">Você não selecionou nenhum app. Deseja selecionar os apps recomendados?</string>
     <string name="use_recommended_message">Selecionar os apps recomendados?</string>
+    <string name="menu_select_all">Todos</string>
+    <string name="menu_select_none">Nenhum</string>
+    <string name="menu_auto_include">Auto-incluir</string>
     <string name="module_is_not_activated_yet">O módulo ainda não está ativo</string>
     <string name="requested_by_module">Recomendações</string>
     <string name="update_available">Atualização disponível: %1$s</string>
