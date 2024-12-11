@@ -50,45 +50,6 @@ constexpr int PER_USER_RANGE = 100000;
 static constexpr uid_t kAidInjected = INJECTED_AID;
 static constexpr uid_t kAidInet = 3003;
 
-std::vector<MapInfo> MapInfo::Scan(std::string_view pid) {
-    constexpr static auto kPermLength = 5;
-    constexpr static auto kMapEntry = 7;
-    std::vector<MapInfo> info;
-    auto path = "/proc/" + std::string{pid} + "/maps";
-    auto maps = fopen(path.c_str(), "r");
-    if (maps) {
-        char *line = nullptr;
-        size_t len = 0;
-        ssize_t read;
-        while ((read = getline(&line, &len, maps)) > 0) {
-            line[read - 1] = '\0';
-            uintptr_t start = 0;
-            uintptr_t end = 0;
-            uintptr_t off = 0;
-            ino_t inode = 0;
-            unsigned int dev_major = 0;
-            unsigned int dev_minor = 0;
-            std::array<char, kPermLength> perm{'\0'};
-            int path_off;
-            if (sscanf(line, "%" PRIxPTR "-%" PRIxPTR " %4s %" PRIxPTR " %x:%x %lu %n%*s", &start,
-                       &end, perm.data(), &off, &dev_major, &dev_minor, &inode,
-                       &path_off) != kMapEntry) {
-                continue;
-            }
-            while (path_off < read && isspace(line[path_off])) path_off++;
-            auto &ref = info.emplace_back(MapInfo{start, end, 0, perm[3] == 'p', off,
-                                                  static_cast<dev_t>(makedev(dev_major, dev_minor)),
-                                                  inode, line + path_off});
-            if (perm[0] == 'r') ref.perms |= PROT_READ;
-            if (perm[1] == 'w') ref.perms |= PROT_WRITE;
-            if (perm[2] == 'x') ref.perms |= PROT_EXEC;
-        }
-        free(line);
-    }
-    fclose(maps);
-    return info;
-}
-
 void MagiskLoader::LoadDex(JNIEnv *env, PreloadedDex &&dex) {
     auto classloader = JNI_FindClass(env, "java/lang/ClassLoader");
     auto getsyscl_mid = JNI_GetStaticMethodID(env, classloader, "getSystemClassLoader",
