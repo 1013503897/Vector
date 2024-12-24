@@ -296,6 +296,19 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
         dependsOn(flashKsuTask)
         commandLine(adb, "shell", "su", "-c", "/system/bin/svc", "power", "reboot")
     }
+    val flashAPatchTask = task<Exec>("flashAPatch${variantCapped}") {
+        group = "LSPosed"
+        dependsOn(pushTask)
+        commandLine(
+            adb, "shell", "su", "-c",
+            "apd module install /data/local/tmp/${zipFileName}"
+        )
+    }
+    task<Exec>("flashAPatchAndReboot${variantCapped}") {
+        group = "LSPosed"
+        dependsOn(flashAPatchTask)
+        commandLine(adb, "shell", "su", "-c", "/system/bin/svc", "power", "reboot")
+    }
 }
 
 afterEvaluate {
