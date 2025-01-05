@@ -299,7 +299,7 @@ public class ConfigManager {
         try {
             var perms = PosixFilePermissions.fromString("rwx--x--x");
             Files.createDirectories(miscPath, PosixFilePermissions.asFileAttribute(perms));
-            walkFileTree(miscPath, f -> SELinux.setFileContext(f.toString(), "u:object_r:magisk_file:s0"));
+            walkFileTree(miscPath, f -> SELinux.setFileContext(f.toString(), "u:object_r:xposed_data:s0"));
         } catch (IOException e) {
             Log.e(TAG, Log.getStackTraceString(e));
         }

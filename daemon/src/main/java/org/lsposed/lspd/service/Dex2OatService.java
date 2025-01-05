@@ -171,7 +171,7 @@ public class Dex2OatService implements Runnable {
         Log.i(TAG, "Dex2oat wrapper daemon start");
         var sockPath = getSockPath();
         Log.d(TAG, "wrapper path: " + sockPath);
-        var magisk_file = "u:object_r:magisk_file:s0";
+        var xposed_file = "u:object_r:xposed_file:s0";
         var dex2oat_exec = "u:object_r:dex2oat_exec:s0";
         if (SELinux.checkSELinuxAccess("u:r:dex2oat:s0", dex2oat_exec,
                 "file", "execute_no_trans")) {
@@ -179,8 +179,8 @@ public class Dex2OatService implements Runnable {
             SELinux.setFileContext(WRAPPER64, dex2oat_exec);
             setSockCreateContext("u:r:dex2oat:s0");
         } else {
-            SELinux.setFileContext(WRAPPER32, magisk_file);
-            SELinux.setFileContext(WRAPPER64, magisk_file);
+            SELinux.setFileContext(WRAPPER32, xposed_file);
+            SELinux.setFileContext(WRAPPER64, xposed_file);
             setSockCreateContext("u:r:installd:s0");
         }
         try (var server = new LocalServerSocket(sockPath)) {
