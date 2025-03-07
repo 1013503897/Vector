@@ -75,9 +75,9 @@ namespace lspd {
                           "_ZNK7android12ResXMLParser18getAttributeNameIDEm")))) {
             return false;
         }
-        return android::ResStringPool::setup(lsplant::InitInfo {
+        return android::ResStringPool::setup(InitInfo {
             .art_symbol_resolver = [&](auto s) {
-                return fw.template getSymbAddress(s);
+                return fw.template getSymbAddress<>(s);
             }
         });
     }
@@ -111,7 +111,7 @@ namespace lspd {
 
     // @ApiSensitive(Level.MIDDLE)
     LSP_DEF_NATIVE_METHOD(jboolean, ResourcesHook, makeInheritable, jclass target_class) {
-        if (lsplant::MakeClassInheritable(env, target_class)) {
+        if (MakeClassInheritable(env, target_class)) {
             return JNI_TRUE;
         }
         return JNI_FALSE;

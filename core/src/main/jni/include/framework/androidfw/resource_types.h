@@ -24,6 +24,8 @@
 #include <cstdint>
 #include "utils/hook_helper.hpp"
 
+using lsplant::operator""_sym;
+
 // @ApiSensitive(Level.MIDDLE)
 namespace android {
 
@@ -142,11 +144,11 @@ namespace android {
 
         using stringAtRet = expected<StringPiece16, NullOrIOError>;
 
-        inline static lsplant::MemberFunction<{"_ZNK7android13ResStringPool8stringAtEjPj",
-            "_ZNK7android13ResStringPool8stringAtEmPm"}, ResStringPool, stringAtRet (size_t)> stringAtS_;
+        inline static auto stringAtS_ = ("_ZNK7android13ResStringPool8stringAtEjPj"_sym |
+                "_ZNK7android13ResStringPool8stringAtEmPm"_sym).as<stringAtRet (ResStringPool::*)(size_t)>;
 
-        inline static lsplant::MemberFunction<{"_ZNK7android13ResStringPool8stringAtEj",
-            "_ZNK7android13ResStringPool8stringAtEm"}, ResStringPool, const char16_t* (size_t, size_t *)> stringAt_;
+        inline static auto stringAt_ = ("_ZNK7android13ResStringPool8stringAtEj"_sym |
+                "_ZNK7android13ResStringPool8stringAtEm"_sym).as<const char16_t* (ResStringPool::*)(size_t, size_t *)>;
 
         StringPiece16 stringAt(size_t idx) const {
             if (stringAt_) {
@@ -163,7 +165,7 @@ namespace android {
         }
 
         static bool setup(const lsplant::HookHandler &handler) {
-            return handler.dlsym(stringAt_) || handler.dlsym(stringAtS_);
+            return handler(stringAt_) || handler(stringAtS_);
         }
     };
 
