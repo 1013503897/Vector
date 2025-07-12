@@ -143,7 +143,7 @@ val generateWebRoot = tasks.register<Copy>("generateWebRoot") {
     doLast {
         exec {
             workingDir = webroottmp
-            commandLine("pnpm", "add", "-D", "parcel-bundler", "kernelsu")
+            commandLine("pnpm", "add", "-D", "parcel", "kernelsu")
         }
         exec {
             workingDir = webroottmp
