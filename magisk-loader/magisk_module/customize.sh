@@ -90,7 +90,7 @@ if [ "$FLAVOR" == "zygisk" ]; then
     mkdir -p "$MODPATH/webroot"
     extract "$ZIPFILE" "webroot/index.html" "$MODPATH/webroot" true
     # evaluate if use awk or tr -s ' ' | cut -d' ' -f5
-    SRCJS=$(unzip -l "$ZIPFILE" | grep "webroot/src" | grep -v sha256 | awk '{print $4}')
+    SRCJS=$(unzip -l "$ZIPFILE" | grep "webroot/generate" | grep -v sha256 | awk '{print $4}')
     extract "$ZIPFILE" "$SRCJS" "$MODPATH/webroot" true
   fi
 
