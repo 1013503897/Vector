@@ -10,7 +10,7 @@ A Zygisk module trying to provide an ART hooking framework which delivers consis
 
 ## Supported Versions
 
-Android 8.1 ~ 15
+Android 8.1 ~ 16
 
 ## Install
 
@@ -44,9 +44,7 @@ We use our own module repository. We welcome developers to submit modules to our
 
 ## Community Discussion
 
-- Telegram: [@LSPosed](https://t.me/s/LSPosed)
-
-Notice: These community groups don't accept any bug report, please use [Get help](#get-help) to report.
+[Troubleshooting guide](https://github.com/JingMatrix/LSPosed/issues/123) and [Disscusions](https://github.com/JingMatrix/LSPosed/discussions).
 
 ## Translation Contributing
 
