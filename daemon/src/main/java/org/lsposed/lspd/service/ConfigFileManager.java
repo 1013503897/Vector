@@ -457,7 +457,7 @@ public class ConfigFileManager {
         if (uid != -1) {
             if (path.toFile().mkdirs()) {
                 try {
-                    SELinux.setFileContext(path.toString(), "u:object_r:xposed_file:s0");
+                    SELinux.setFileContext(path.toString(), "u:object_r:xposed_data:s0");
                     Os.chown(path.toString(), uid, uid);
                     Os.chmod(path.toString(), 0755);
                 } catch (ErrnoException e) {
