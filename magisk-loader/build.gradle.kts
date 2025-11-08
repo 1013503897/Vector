@@ -108,7 +108,7 @@ dependencies {
     compileOnly(projects.hiddenapi.stubs)
 }
 
-val zipAll = task("zipAll") {
+val zipAll = tasks.register("zipAll") {
     group = "LSPosed"
 }
 
@@ -125,7 +125,7 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
     val moduleId = "${flavorLowered}_$moduleBaseId"
     val zipFileName = "$moduleName-v$verName-$verCode-${flavorLowered}-$buildTypeLowered.zip"
 
-    val prepareMagiskFilesTask = task<Sync>("prepareMagiskFiles$variantCapped") {
+    val prepareMagiskFilesTask = tasks.register<Sync>("prepareMagiskFiles$variantCapped") {
         group = "LSPosed"
         dependsOn(
             "assemble$variantCapped",
@@ -204,7 +204,7 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
         }
     }
 
-    val zipTask = task<Zip>("zip${variantCapped}") {
+    val zipTask = tasks.register<Zip>("zip${variantCapped}") {
         group = "LSPosed"
         dependsOn(prepareMagiskFilesTask)
         archiveFileName = zipFileName
@@ -212,16 +212,18 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
         from(magiskDir)
     }
 
-    zipAll.dependsOn(zipTask)
+    zipAll.configure {
+        dependsOn(zipTask)
+    }
 
     val adb: String = androidComponents.sdkComponents.adb.get().asFile.absolutePath
-    val pushTask = task<Exec>("push${variantCapped}") {
+    val pushTask = tasks.register<Exec>("push${variantCapped}") {
         group = "LSPosed"
         dependsOn(zipTask)
         workingDir("${projectDir}/release")
         commandLine(adb, "push", zipFileName, "/data/local/tmp/")
     }
-    val flashMagiskTask = task<Exec>("flashMagisk${variantCapped}") {
+    val installMagiskTask = tasks.register<Exec>("installMagisk${variantCapped}") {
         group = "LSPosed"
         dependsOn(pushTask)
         commandLine(
@@ -229,12 +231,12 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
             "magisk --install-module /data/local/tmp/${zipFileName}"
         )
     }
-    task<Exec>("flashMagiskAndReboot${variantCapped}") {
+    tasks.register<Exec>("installMagiskAndReboot${variantCapped}") {
         group = "LSPosed"
-        dependsOn(flashMagiskTask)
+        dependsOn(installMagiskTask)
         commandLine(adb, "shell", "su", "-c", "/system/bin/svc", "power", "reboot")
     }
-    val flashKsuTask = task<Exec>("flashKsu${variantCapped}") {
+    val installKsuTask = tasks.register<Exec>("installKsu${variantCapped}") {
         group = "LSPosed"
         dependsOn(pushTask)
         commandLine(
@@ -242,12 +244,12 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
             "ksud module install /data/local/tmp/${zipFileName}"
         )
     }
-    task<Exec>("flashKsuAndReboot${variantCapped}") {
+    tasks.register<Exec>("installKsuAndReboot${variantCapped}") {
         group = "LSPosed"
-        dependsOn(flashKsuTask)
+        dependsOn(installKsuTask)
         commandLine(adb, "shell", "su", "-c", "/system/bin/svc", "power", "reboot")
     }
-    val flashAPatchTask = task<Exec>("flashAPatch${variantCapped}") {
+    val installAPatchTask = tasks.register<Exec>("installAPatch${variantCapped}") {
         group = "LSPosed"
         dependsOn(pushTask)
         commandLine(
@@ -255,78 +257,15 @@ fun afterEval() = android.applicationVariants.forEach { variant ->
             "apd module install /data/local/tmp/${zipFileName}"
         )
     }
-    task<Exec>("flashAPatchAndReboot${variantCapped}") {
+    tasks.register<Exec>("installAPatchAndReboot${variantCapped}") {
         group = "LSPosed"
-        dependsOn(flashAPatchTask)
+        dependsOn(installAPatchTask)
         commandLine(adb, "shell", "su", "-c", "/system/bin/svc", "power", "reboot")
     }
 }
 
 afterEvaluate {
     afterEval()
-}
-
-val adb: String = androidComponents.sdkComponents.adb.get().asFile.absolutePath
-val killLspd = task<Exec>("killLspd") {
-    group = "LSPosed"
-    commandLine(adb, "shell", "su", "-c", "killall", "lspd")
-    isIgnoreExitValue = true
-}
-val pushDaemon = task<Exec>("pushDaemon") {
-    group = "LSPosed"
-    dependsOn(":daemon:assembleDebug")
-    workingDir(project(":daemon").layout.buildDirectory.dir("outputs/apk/debug"))
-    commandLine(adb, "push", "daemon-debug.apk", "/data/local/tmp/daemon.apk")
-}
-val pushDaemonNative = task<Exec>("pushDaemonNative") {
-    group = "LSPosed"
-    dependsOn(":daemon:assembleDebug")
-    doFirst {
-        val abi: String = ByteArrayOutputStream().use { outputStream ->
-            exec {
-                commandLine(adb, "shell", "getprop", "ro.product.cpu.abi")
-                standardOutput = outputStream
-            }
-            outputStream.toString().trim()
-        }
-        workingDir(project(":daemon").layout.buildDirectory.dir("intermediates/stripped_native_libs/debug/stripDebugDebugSymbols/out/lib/$abi"))
-    }
-    commandLine(adb, "push", "libdaemon.so", "/data/local/tmp/libdaemon.so")
-}
-val reRunDaemon = task<Exec>("reRunDaemon") {
-    group = "LSPosed"
-    dependsOn(pushDaemon, pushDaemonNative, killLspd)
-    // tricky to pass a minus number to avoid the injection warning
-    commandLine(
-        adb, "shell", "ASH_STANDALONE=1", "su", "-mm", "-pc",
-        "/data/adb/magisk/busybox sh /data/adb/modules/*_lsposed/service.sh --system-server-max-retry=-1&"
-    )
-    isIgnoreExitValue = true
-}
-val tmpApk = "/data/local/tmp/manager.apk"
-val pushApk = task<Exec>("pushApk") {
-    group = "LSPosed"
-    dependsOn(":app:assembleDebug")
-    doFirst {
-        exec {
-            commandLine(adb, "shell", "su", "-c", "rm", "-f", tmpApk)
-        }
-    }
-    workingDir(project(":app").layout.buildDirectory.dir("outputs/apk/debug"))
-    commandLine(adb, "push", "app-debug.apk", tmpApk)
-}
-val openApp = task<Exec>("openApp") {
-    group = "LSPosed"
-    commandLine(
-        adb, "shell",
-        "am", "start", "-c", "org.lsposed.manager.LAUNCH_MANAGER",
-        "com.android.shell/.BugreportWarningActivity"
-    )
-}
-task("reRunApp") {
-    group = "LSPosed"
-    dependsOn(pushApk)
-    finalizedBy(reRunDaemon)
 }
 
 evaluationDependsOn(":app")
