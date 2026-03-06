@@ -138,8 +138,8 @@ public class Dex2OatService implements Runnable {
             checkAndAddDex2Oat("/apex/com.android.art/bin/dex2oatd64");
         }
 
-        openDex2oat(4, "/data/adb/modules/zygisk_lsposed/bin/liboat_hook32.so");
-        openDex2oat(5, "/data/adb/modules/zygisk_lsposed/bin/liboat_hook64.so");
+        openDex2oat(4, "/data/adb/modules/zygisk_vector/bin/liboat_hook32.so");
+        openDex2oat(5, "/data/adb/modules/zygisk_vector/bin/liboat_hook64.so");
 
         var enforce = Paths.get("/sys/fs/selinux/enforce");
         var policy = Paths.get("/sys/fs/selinux/policy");

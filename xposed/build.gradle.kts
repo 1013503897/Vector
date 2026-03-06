@@ -11,13 +11,10 @@ android {
 
     buildFeatures { androidResources { enable = false } }
 
-    sourceSets {
-        named("main") {
-            java.srcDirs("src/main/kotlin", "libxposed/api/src/main/java")
-        }
-    }
+    sourceSets { named("main") { java.srcDirs("src/main/kotlin", "libxposed/api/src/main/java") } }
 }
 
 dependencies {
     compileOnly(libs.androidx.annotation)
+    compileOnly(projects.hiddenapi.stubs)
 }

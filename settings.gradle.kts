@@ -17,6 +17,7 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "LSPosed"
+
 include(
     ":app",
     ":core",
@@ -30,4 +31,5 @@ include(
     ":services:manager-service",
     ":services:daemon-service",
     ":xposed",
+    ":zygisk",
 )

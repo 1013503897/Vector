@@ -19,8 +19,7 @@ import java.util.Map;
 
 public class BridgeService {
 
-    static final int TRANSACTION_CODE = ('_' << 24) | ('L' << 16) | ('S' << 8) | 'P'; // 1598837584
-    private static final String DESCRIPTOR = "LSPosed";
+    static final int TRANSACTION_CODE = ('_' << 24) | ('V' << 16) | ('E' << 8) | 'C';
     private static final String SERVICE_NAME = "activity";
 
     enum ACTION {
@@ -132,7 +131,6 @@ public class BridgeService {
                 Parcel data = Parcel.obtain();
                 Parcel reply = Parcel.obtain();
                 try {
-                    data.writeInterfaceToken(DESCRIPTOR);
                     data.writeInt(ACTION.ACTION_SEND_BINDER.ordinal());
                     Log.v(TAG, "binder " + binder.toString());
                     data.writeStrongBinder(binder);
