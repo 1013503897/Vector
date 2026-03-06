@@ -1,4 +1,8 @@
+#include <linux/memfd.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -144,7 +148,29 @@ int main(int argc, char **argv) {
 
     if (hooker_fd == -1) {
         LOGE("failed to read liboat_hook.so");
+    } else {
+        int mem_fd = syscall(__NR_memfd_create, "liboat_hook_memfd", 0);
+        if (mem_fd >= 0) {
+            // Get the exact size of the original library
+            LOGD("Copying %d as mem_fd %d", hooker_fd, mem_fd);
+            struct stat st;
+            if (fstat(hooker_fd, &st) == 0) {
+                // Tell the kernel to copy the entire file directly to the memfd
+                off_t offset = 0;
+                sendfile(mem_fd, hooker_fd, &offset, st.st_size);
+
+                // Swap the old FD with the new memfd
+                close(hooker_fd);
+                hooker_fd = mem_fd;
+            } else {
+                PLOGE("fstat failed");
+                close(mem_fd);
+            }
+        } else {
+            PLOGE("memfd_create failed, falling back to original fd");
+        }
     }
+
     LOGD("sock: %s stock_fd: %d", sock.sun_path + 1, stock_fd);
 
     // Prepare arguments for execve
@@ -176,6 +202,7 @@ int main(int argc, char **argv) {
 
     // Set LD_PRELOAD to point to the hooker library FD
     std::string preload_val = "LD_PRELOAD=/proc/self/fd/" + std::to_string(hooker_fd);
+    LOGD("Inject oat hook via %s", preload_val.data());
     setenv("LD_PRELOAD", ("/proc/self/fd/" + std::to_string(hooker_fd)).c_str(), 1);
 
     // Pass original argv[0] as DEX2OAT_CMD
