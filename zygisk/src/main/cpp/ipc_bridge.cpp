@@ -84,8 +84,6 @@ private:
 // The name of the system service we use as a rendezvous point to find our manager service.
 // Using "activity" is a common technique as it's always available.
 constexpr auto kBridgeServiceName = "activity"sv;
-// A different rendezvous point used only by the system_server.
-constexpr auto kSystemServerBridgeServiceName = "serial"sv;
 
 // Transaction codes for specific actions.
 constexpr jint kBridgeTransactionCode = ('_' << 24) | ('V' << 16) | ('E' << 8) | 'C';
@@ -299,14 +297,14 @@ lsplant::ScopedLocalRef<jobject> IPCBridge::RequestAppBinder(JNIEnv *env, jstrin
     return result_binder;
 }
 
-lsplant::ScopedLocalRef<jobject> IPCBridge::RequestSystemServerBinder(JNIEnv *env) {
+lsplant::ScopedLocalRef<jobject> IPCBridge::RequestSystemServerBinder(
+    JNIEnv *env, std::string bridgeServiceName) {
     if (!initialized_) {
         LOGE("RequestSystemServerBinder failed: IPCBridge not initialized.");
         return {env, nullptr};
     }
 
-    auto service_name =
-        lsplant::ScopedLocalRef(env, env->NewStringUTF(kSystemServerBridgeServiceName.data()));
+    auto service_name = lsplant::ScopedLocalRef(env, env->NewStringUTF(bridgeServiceName.data()));
     lsplant::ScopedLocalRef<jobject> binder = {env, nullptr};
 
     // The system_server might start its services slightly after Zygisk injects us.
@@ -315,11 +313,12 @@ lsplant::ScopedLocalRef<jobject> IPCBridge::RequestSystemServerBinder(JNIEnv *en
         binder = lsplant::JNI_CallStaticObjectMethod(env, service_manager_class_,
                                                      get_service_method_, service_name.get());
         if (binder) {
-            LOGI("Got system server binder on attempt {}.", i + 1);
+            LOGI("Got system server binder via {} on attempt {}.", bridgeServiceName.data(), i + 1);
             return binder;
         }
         if (i < 2) {
-            LOGW("Failed to get system server binder, will retry in 1 second...");
+            LOGW("Failed to get system server binder via {}, will retry in 1 second...",
+                 bridgeServiceName.data());
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
     }

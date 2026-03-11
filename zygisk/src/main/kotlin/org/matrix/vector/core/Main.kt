@@ -17,12 +17,19 @@ object Main {
      * Shared initialization logic for both System Server and Application processes.
      *
      * @param isSystem True if this is the system_server process.
+     * @param isLateInject True if Zygisk APIs are not invoked via hooks
      * @param niceName The process name (e.g., package name or "system").
      * @param appDir The application's data directory.
      * @param binder The Binder token associated with the application service.
      */
     @JvmStatic
-    fun forkCommon(isSystem: Boolean, niceName: String, appDir: String?, binder: IBinder) {
+    fun forkCommon(
+        isSystem: Boolean,
+        isLateInject: Boolean,
+        niceName: String,
+        appDir: String?,
+        binder: IBinder,
+    ) {
         // Initialize system-specific resolution hooks if in system_server
         if (isSystem) {
             ParasiticManagerSystemHooker.start()
@@ -46,6 +53,6 @@ object Main {
 
         // Standard Xposed module loading for third-party apps
         Utils.logI("Loading Vector/Xposed for $niceName (UID: ${Process.myUid()})")
-        Startup.bootstrapXposed()
+        Startup.bootstrapXposed(isSystem && isLateInject)
     }
 }
