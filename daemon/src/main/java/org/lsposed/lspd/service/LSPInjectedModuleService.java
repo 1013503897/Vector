@@ -30,8 +30,12 @@ public class LSPInjectedModuleService extends ILSPInjectedModuleService.Stub {
     }
 
     @Override
-    public int getFrameworkPrivilege() {
-        return IXposedService.FRAMEWORK_PRIVILEGE_ROOT;
+    public long getFrameworkProperties() {
+        var prop = IXposedService.PROP_CAP_SYSTEM | IXposedService.PROP_CAP_REMOTE;
+        if (ConfigManager.getInstance().dexObfuscate()) {
+            prop = prop | IXposedService.PROP_RT_API_PROTECTION;
+        }
+        return prop;
     }
 
     @Override

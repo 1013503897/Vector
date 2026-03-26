@@ -35,7 +35,7 @@ constexpr int PER_USER_RANGE = 100000;
 // Defined via CMake generated marcos
 constexpr uid_t kHostPackageUid = INJECTED_PACKAGE_UID;
 const char *const kHostPackageName = INJECTED_PACKAGE_NAME;
-const char *const kManagePackageName = MANAGER_PACKAGE_NAME;
+const char *const kManagerPackageName = MANAGER_PACKAGE_NAME;
 constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
 
 enum RuntimeFlags : uint32_t {
@@ -126,6 +126,8 @@ private:
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol); },
+        .generated_class_name = "Vector_",
+        .generated_source_name = "Dobby",
     };
 
     // State managed within the class instance for each forked process.
@@ -238,7 +240,7 @@ void VectorModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     // grant it internet permissions by adding it to the INET group.
     if (args->uid == kHostPackageUid) {
         lsplant::JUTFString nice_name_str(env_, args->nice_name);
-        if (nice_name_str.get() == std::string(kManagePackageName)) {
+        if (nice_name_str.get() == std::string(kManagerPackageName)) {
             LOGI("Manager app detected. Granting internet permissions.");
             is_manager_app_ = true;
 
@@ -303,7 +305,7 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     }
 
     if (is_manager_app_) {
-        args->nice_name = env_->NewStringUTF(kManagePackageName);
+        args->nice_name = env_->NewStringUTF(kManagerPackageName);
     }
 
     // --- Framework Injection ---
