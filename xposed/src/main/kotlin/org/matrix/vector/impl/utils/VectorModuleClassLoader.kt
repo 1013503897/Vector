@@ -15,6 +15,7 @@ import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.Enumeration
 import java.util.jar.JarFile
+import java.util.stream.Collectors
 import java.util.zip.ZipEntry
 
 /**
@@ -159,7 +160,7 @@ class VectorModuleClassLoader : ByteBufferDexClassLoader {
                             null
                         }
                     }
-                    .toList()
+                    .collect(Collectors.toList())
                     .filterNotNull()
                     .toTypedArray()
 
