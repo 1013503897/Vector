@@ -138,7 +138,6 @@
     <string name="no_scope_selected">Du valde inte någon app. Fortsätt?</string>
     <string name="menu_show_games">Spel</string>
     <string name="menu_show_modules">Moduler</string>
-    <string name="menu_show_denylist">Neka</string>
     <string name="failed_to_save_scope_list">Det gick inte att spara omfattningslistan</string>
     <string name="app_version">Version: %1$s</string>
     <string name="menu_select">Välj</string>
@@ -162,8 +161,6 @@
     <string name="reboot_required">Omstart krävs för att denna ändring ska gälla</string>
     <string name="reboot">Reboot</string>
     <string name="menu_hide">Dölj</string>
-    <string name="deny_list">%s finns på förnekarlistan. Det kan inte börja gälla.</string>
-    <string name="deny_list_info">På förnekelselista</string>
     <!-- ModulesActivity and AppListActivity -->
     <string name="modules_other_app">Visa i annan app</string>
     <string name="module_app_info">Information om appen</string>
@@ -172,8 +169,6 @@
     <string name="settings_group_framework">Framework</string>
     <string name="settings_disable_verbose_log">Inaktivera utförliga loggar</string>
     <string name="settings_disable_verbose_log_summary">Begäran om att inkludera verbose-loggar i rapporten</string>
-    <string name="settings_enable_log_watchdog">Aktivera loggövervakning</string>
-    <string name="settings_enable_log_watchdog_summary">Loggövervakning av LSPosed ändrar systemegenskaper, vilket kan utnyttjas för att upptäcka LSPosed</string>
     <string name="pure_black_dark_theme">Svart mörkt tema</string>
     <string name="pure_black_dark_theme_summary">Använd det rena svarta temat om mörkt tema är aktiverat</string>
     <string name="settings_group_theme">Tema</string>
@@ -202,13 +197,10 @@
     <string name="settings_unsupported_pin_shortcut_summary">Den nuvarande standardstartaren har inte stöd för genvägar med stift</string>
     <string name="settings_enable_status_notification">Meddelande om status</string>
     <string name="settings_enable_status_notification_summary">Visa en anmälan som kan öppna parasitansvarig</string>
-    <string name="disable_status_notification_error">Ingen genväg, kan inte inaktivera anmälan</string>
     <string name="settings_update_channel">Uppdatera kanal</string>
     <string name="update_channel_stable">Stabil</string>
     <string name="update_channel_bate">Beta</string>
     <string name="update_channel_nightly">Nattligt bygg</string>
-    <string name="settings_xposed_api_call_protection">Skydd av Xposed API-anrop</string>
-    <string name="settings_xposed_api_call_protection_summary">Blockera dynamiskt laddad modulkod för att använda Xposed API, vilket kan förstöra vissa moduler men gynnar säkerheten.</string>
     <!-- Module Repo -->
     <string name="module_readme">Läsa</string>
     <string name="module_releases">Släpp</string>

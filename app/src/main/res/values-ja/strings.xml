@@ -136,7 +136,6 @@
     <string name="no_scope_selected">アプリが選択されていません。よろしいですか？</string>
     <string name="menu_show_games">ゲーム</string>
     <string name="menu_show_modules">モジュール</string>
-    <string name="menu_show_denylist">Denylist</string>
     <string name="failed_to_save_scope_list">スコープリストの保存に失敗しました</string>
     <string name="app_version">バージョン: %1$s</string>
     <string name="menu_select">選択</string>
@@ -160,8 +159,6 @@
     <string name="reboot_required">この設定を適用するには再起動が必要です</string>
     <string name="reboot">再起動</string>
     <string name="menu_hide">非表示</string>
-    <string name="deny_list">%s が DenyList に登録されています。効果がないかもしれません。</string>
-    <string name="deny_list_info">DenyList に登録されています</string>
     <!-- ModulesActivity and AppListActivity -->
     <string name="modules_other_app">他のアプリで表示</string>
     <string name="module_app_info">アプリの情報</string>
@@ -170,8 +167,6 @@
     <string name="settings_group_framework">フレームワーク</string>
     <string name="settings_disable_verbose_log">詳細ログの無効化</string>
     <string name="settings_disable_verbose_log_summary">問題を報告する際は、詳細なログを含めるようにしてください</string>
-    <string name="settings_enable_log_watchdog">ログウォッチドッグを有効化</string>
-    <string name="settings_enable_log_watchdog_summary">LSPosed のログウォッチドッグはシステムプロパティを変更し、LSPosed を検出するために悪用される可能性があります</string>
     <string name="pure_black_dark_theme">黒のダークテーマ</string>
     <string name="pure_black_dark_theme_summary">ダークテーマが有効になっている場合は、ピュアブラックテーマを使用します</string>
     <string name="settings_group_theme">テーマ</string>
@@ -200,13 +195,10 @@
     <string name="settings_unsupported_pin_shortcut_summary">現在のデフォルトランチャーはショートカットのピン留めをサポートしていません</string>
     <string name="settings_enable_status_notification">ステータス通知</string>
     <string name="settings_enable_status_notification_summary">パラサイトマネージャーを開くことができる通知を表示します</string>
-    <string name="disable_status_notification_error">ショートカットがないため、通知を無効にできません</string>
     <string name="settings_update_channel">更新チャンネル</string>
     <string name="update_channel_stable">安定版</string>
     <string name="update_channel_bate">ベータ版</string>
     <string name="update_channel_nightly">ナイトリービルド</string>
-    <string name="settings_xposed_api_call_protection">Xposed API の呼び出し保護</string>
-    <string name="settings_xposed_api_call_protection_summary">動的にロードされたモジュールコードが Xposed API を使用するのをブロックします。これにより一部のモジュールが動作しなくなる可能性がありますが、セキュリティが向上します。</string>
     <!-- Module Repo -->
     <string name="module_readme">Readme</string>
     <string name="module_releases">リリース</string>

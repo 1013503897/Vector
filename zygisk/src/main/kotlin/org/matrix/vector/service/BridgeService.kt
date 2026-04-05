@@ -5,10 +5,9 @@ import android.os.Binder
 import android.os.IBinder
 import android.os.IBinder.DeathRecipient
 import android.os.Parcel
-import android.os.Process
 import hidden.HiddenApiBridge.Binder_allowBlocking
 import hidden.HiddenApiBridge.Context_getActivityToken
-import org.lsposed.lspd.service.ILSPosedService
+import org.lsposed.lspd.service.IDaemonService
 import org.lsposed.lspd.util.Utils.Log
 
 /**
@@ -20,35 +19,34 @@ import org.lsposed.lspd.util.Utils.Log
 object BridgeService {
     private const val TRANSACTION_CODE =
         ('_'.code shl 24) or ('V'.code shl 16) or ('E'.code shl 8) or 'C'.code
-    private const val TAG = "VectorBridge"
+    private const val TAG = "VectorZygiskBridge"
 
     /** Actions supported by the manual IPC bridge. */
     private enum class Action {
         UNKNOWN,
         SEND_BINDER, // Daemon sending the system service binder
         GET_BINDER, // Process requesting its specific application service
-        ENABLE_MANAGER, // Toggle manager state
     }
 
     @Volatile private var serviceBinder: IBinder? = null
 
-    @Volatile private var service: ILSPosedService? = null
+    @Volatile private var service: IDaemonService? = null
 
-    /** Cleans up service references if the remote LSPosed process crashes. */
+    /** Cleans up service references if the remote Vector daemon crashes. */
     private val serviceRecipient: DeathRecipient = DeathRecipient {
-        Log.e(TAG, "LSPosed system service died.")
+        Log.e(TAG, "Vector daemin service died.")
         serviceBinder?.unlinkToDeath(this.serviceRecipient, 0)
         serviceBinder = null
         service = null
     }
 
-    /** Returns the active LSPosed system service interface. */
-    @JvmStatic fun getService(): ILSPosedService? = service
+    /** Returns the active Vector daemin service interface. */
+    @JvmStatic fun getService(): IDaemonService? = service
 
     /**
-     * Initializes the client-side connection to the LSPosed system service.
+     * Initializes the client-side connection to the Vector daemin service.
      *
-     * @param binder The raw binder for [ILSPosedService].
+     * @param binder The raw binder for [IDaemonService].
      */
     private fun receiveFromBridge(binder: IBinder?) {
         if (binder == null) {
@@ -67,7 +65,7 @@ object BridgeService {
         // Allow blocking calls since we are often in a synchronous fork path
         val blockingBinder = Binder_allowBlocking(binder)
         serviceBinder = blockingBinder
-        service = ILSPosedService.Stub.asInterface(blockingBinder)
+        service = IDaemonService.Stub.asInterface(blockingBinder)
 
         runCatching { blockingBinder.linkToDeath(serviceRecipient, 0) }
             .onFailure { Log.e(TAG, "Failed to link to service death", it) }
@@ -78,15 +76,11 @@ object BridgeService {
                 val at = activityThread.applicationThread as android.app.IApplicationThread
                 val atBinder = at.asBinder()
                 val systemCtx = activityThread.systemContext
-                service?.dispatchSystemServerContext(
-                    atBinder,
-                    Context_getActivityToken(systemCtx),
-                    "Zygisk",
-                )
+                service?.dispatchSystemServerContext(atBinder, Context_getActivityToken(systemCtx))
             }
             .onFailure { Log.e(TAG, "Failed to dispatch system context", it) }
 
-        Log.i(TAG, "LSPosed system service binder linked.")
+        Log.i(TAG, "Vector daemin service binder linked.")
     }
 
     /** Handles manual parcel transactions. Called via reflection/JNI from the native hook. */
@@ -125,21 +119,6 @@ object BridgeService {
                         true
                     } else false
                 }
-
-                Action.ENABLE_MANAGER -> {
-                    val uid = Binder.getCallingUid()
-                    // Restricted to Root, System, or Shell
-                    if (
-                        (uid == 0 || uid == Process.SHELL_UID || uid == Process.SYSTEM_UID) &&
-                            service != null
-                    ) {
-                        val enabled = data.readInt() == 1
-                        val result = service?.setManagerEnabled(enabled) ?: false
-                        reply?.writeInt(if (result) 1 else 0)
-                        true
-                    } else false
-                }
-
                 else -> false
             }
         } catch (e: Throwable) {

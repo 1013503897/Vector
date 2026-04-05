@@ -138,7 +138,6 @@
     <string name="no_scope_selected">No seleccionaste ninguna aplicación. ¿Quieres continuar?</string>
     <string name="menu_show_games">Juegos</string>
     <string name="menu_show_modules">Módulos</string>
-    <string name="menu_show_denylist">Lista de denegación</string>
     <string name="failed_to_save_scope_list">Fallo al guardar la lista de scopes</string>
     <string name="app_version">Versión: %1$s</string>
     <string name="menu_select">Seleccionar</string>
@@ -162,8 +161,6 @@
     <string name="reboot_required">Necesitas reiniciar la aplicación para aplicar este cambio</string>
     <string name="reboot">Reiniciar</string>
     <string name="menu_hide">Ocultar</string>
-    <string name="deny_list">%s está en la lista de negación. Puede no tener efecto.</string>
-    <string name="deny_list_info">En lista de denegación</string>
     <!-- ModulesActivity and AppListActivity -->
     <string name="modules_other_app">Ver en otra aplicación</string>
     <string name="module_app_info">Información de la aplicación</string>
@@ -172,8 +169,6 @@
     <string name="settings_group_framework">Framework</string>
     <string name="settings_disable_verbose_log">Desactivar registros detallados</string>
     <string name="settings_disable_verbose_log_summary">Solicitud de inclusión de registros detallados en los informes de incidencias</string>
-    <string name="settings_enable_log_watchdog">Habilitar el watchdog de registro</string>
-    <string name="settings_enable_log_watchdog_summary">El watchdog de registro de LSPosed modifica propiedades del sistema, lo que podría usarse para detectar LSPosed</string>
     <string name="pure_black_dark_theme">Tema negro oscuro</string>
     <string name="pure_black_dark_theme_summary">Usar el tema negro puro si el tema oscuro está activado</string>
     <string name="settings_group_theme">Tema</string>
@@ -202,13 +197,10 @@
     <string name="settings_unsupported_pin_shortcut_summary">El actual lanzador por defecto no admite accesos directos a pines</string>
     <string name="settings_enable_status_notification">Notificación de estado</string>
     <string name="settings_enable_status_notification_summary">Mostrar una notificación que puede abrir el gestor de parásitos</string>
-    <string name="disable_status_notification_error">No hay acceso directo, no se puede desactivar la notificación</string>
     <string name="settings_update_channel">Actualizar canal</string>
     <string name="update_channel_stable">Estable</string>
     <string name="update_channel_bate">Beta</string>
     <string name="update_channel_nightly">Construcción nocturna</string>
-    <string name="settings_xposed_api_call_protection">Protección de llamadas a la API Xposed</string>
-    <string name="settings_xposed_api_call_protection_summary">Bloquear el código del módulo cargado dinámicamente para utilizar Xposed API, esto puede romper algunos módulos, pero beneficiar a la seguridad</string>
     <!-- Module Repo -->
     <string name="module_readme">Léeme</string>
     <string name="module_releases">Versiones</string>

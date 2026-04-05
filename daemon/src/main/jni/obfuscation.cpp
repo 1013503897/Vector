@@ -23,10 +23,10 @@ namespace {
 std::once_flag init_flag;
 
 std::map<std::string, std::string> signatures = {
-    {"Lde/robv/android/xposed/", ""},    {"Landroid/app/AndroidApp", ""},
-    {"Landroid/content/res/XRes", ""},   {"Landroid/content/res/XModule", ""},
-    {"Lorg/matrix/vector/core/", ""},    {"Lorg/matrix/vector/nativebridge/", ""},
-    {"Lorg/matrix/vector/service/", ""},
+    {"Lde/robv/android/xposed/", ""},         {"Landroid/app/AndroidApp", ""},
+    {"Landroid/content/res/XRes", ""},        {"Landroid/content/res/XModule", ""},
+    {"Lio/github/libxposed/api/Xposed", ""},  {"Lorg/matrix/vector/core/", ""},
+    {"Lorg/matrix/vector/nativebridge/", ""}, {"Lorg/matrix/vector/service/", ""},
 };
 
 jclass class_file_descriptor = nullptr;
@@ -112,7 +112,7 @@ static void ensureInitialized(JNIEnv *env) {
 
         for (auto &i : signatures) {
             i.second = regen(i.first);
-            LOGD("%s => %s", i.first.c_str(), i.second.c_str());
+            LOGV("%s => %s", i.first.c_str(), i.second.c_str());
         }
 
         LOGD("ObfuscationManager init successfully");
@@ -145,7 +145,8 @@ static jobject stringMapToJavaHashMap(JNIEnv *env, const std::map<std::string, s
     return hashMapGlobal;
 }
 
-extern "C" JNIEXPORT jobject JNICALL Java_org_lsposed_lspd_service_ObfuscationManager_getSignatures(
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_matrix_vector_daemon_utils_ObfuscationManager_getSignatures(
     JNIEnv *env, [[maybe_unused]] jclass clazz) {
     ensureInitialized(env);
 
@@ -165,7 +166,6 @@ extern "C" JNIEXPORT jobject JNICALL Java_org_lsposed_lspd_service_ObfuscationMa
 }
 
 static int obfuscateDexBuffer(const void *dex_data, size_t size) {
-    // LOGD("obfuscateDexBuffer: dex_data=%p, size=%zu", dex_data, size);
     dex::Reader reader{reinterpret_cast<const dex::u1 *>(dex_data), size};
     reader.CreateFullIr();
     auto ir = reader.GetIr();
@@ -191,29 +191,32 @@ static int obfuscateDexBuffer(const void *dex_data, size_t size) {
     return allocator.GetFd();
 }
 
-extern "C" JNIEXPORT jobject JNICALL Java_org_lsposed_lspd_service_ObfuscationManager_obfuscateDex(
-    JNIEnv *env, [[maybe_unused]] jclass clazz, jobject memory) {
+extern "C" JNIEXPORT jobject JNICALL
+Java_org_matrix_vector_daemon_utils_ObfuscationManager_obfuscateDex(JNIEnv *env,
+                                                                    [[maybe_unused]] jclass clazz,
+                                                                    jobject memory) {
     ensureInitialized(env);
 
     int fd = ASharedMemory_dupFromJava(env, memory);
     if (fd < 0) return nullptr;
 
     auto size = ASharedMemory_getSize(fd);
-    LOGD("obfuscateDex: fd=%d, size=%zu", fd, size);
+    LOGV("obfuscateDex: fd=%d, size=%zu", fd, size);
 
     // CRITICAL: We MUST use MAP_SHARED here, not MAP_PRIVATE.
-    // 1. Android's SharedMemory is backed by purely virtual IPC buffers (ashmem/memfd).
-    //    If we use MAP_PRIVATE, the kernel attempts to create a Copy-On-Write snapshot.
-    //    Because the Java side just populated this virtual buffer and immediately passed
-    //    it to JNI, mapping it MAP_PRIVATE often results in mapping unpopulated zero-pages,
-    //    which causes Slicer to read a corrupted/empty header and abort.
-    // 2. Using MAP_SHARED gives us direct pointers to the exact physical memory pages
-    //    populated by Java.
-    // 3. ZERO-COPY ARCHITECTURE: Because Slicer's IR holds direct pointers to this mapped
-    //    memory, mutating strings in-place (via const_cast) instantly updates the IR
-    //    without allocating new memory. Since the Java caller discards the original
-    //    SharedMemory buffer anyway, this in-place mutation is completely safe and highly
-    //    efficient.
+    // 1. Android's SharedMemory is backed by ashmem or memfd. Mapping these as
+    //    MAP_PRIVATE creates a Copy-On-Write (COW) layer. In many Android kernel
+    //    configurations, this COW layer does not correctly fault-in the initial
+    //    contents from the shared source, resulting in the JNI side seeing
+    //    unpopulated zero-pages. This causes slicer to fail immediately.
+    // 2. Using MAP_SHARED ensures we have direct access to the same physical
+    //    pages populated by the Java layer.
+    // 3. ZERO-COPY MUTATION: Slicer's Intermediate Representation (IR) points
+    //    directly into this mapped memory for string data. By mutating the
+    //    buffer in-place, we update the IR's state without any additional
+    //    heap allocations. This is safe here because the Daemon owns the
+    //    lifecycle of this temporary buffer and the Java caller will discard
+    //    the un-obfuscated original anyway.
     void *mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (mem == MAP_FAILED) {
         LOGE("Failed to map input dex");
@@ -230,7 +233,7 @@ extern "C" JNIEXPORT jobject JNICALL Java_org_lsposed_lspd_service_ObfuscationMa
     }
 
     if (!needs_obfuscation) {
-        LOGD("No target signatures found in fd=%d, skipping slicer.", fd);
+        LOGV("No target signatures found in fd=%d, skipping slicer.", fd);
         munmap(mem, size);
 
         // Wrap the duplicated FD into Java objects and return instantly
