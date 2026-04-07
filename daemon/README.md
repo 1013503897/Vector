@@ -79,7 +79,7 @@ When the wrapper executes, it connects to the daemon's abstract UNIX domain sock
 
 If the wrapper is disabled or incompatible, the daemon unmounts the binaries and utilizes `resetprop` to inject the inline flag directly into the `dalvik.vm.dex2oat-flags` system property as a fallback. The Kotlin daemon continuously monitors SELinux states via a `FileObserver` on `/sys/fs/selinux/enforce` and its policy files. It dynamically remounts the wrappers if the system drops to permissive mode or alters policy, ensuring the interception persists across state changes.
 
-### Native Logcat Telemetry
+### Native Logcat Monitoring
 Instead of relying on standard logcat shell execution, the daemon runs a native C++ process that interfaces directly with Android's `liblog` buffers (`LOG_ID_MAIN` and `LOG_ID_CRASH`). 
 
 The native parser performs zero-copy processing of log events, strictly filtering output by predefined exact tags (e.g., Magisk, KernelSU) and prefix tags (e.g., dex2oat, Vector, LSPosed). It writes the filtered output into two rotating log files: one for module frameworks and one for verbose system debugging, rotating them automatically when they reach 4MB.
