@@ -11,6 +11,7 @@ import android.os.Looper
 import android.os.Parcel
 import android.os.Process
 import android.os.ServiceManager
+import android.os.SystemProperties
 import android.system.Os
 import android.util.Log
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -41,6 +42,7 @@ object VectorDaemon {
   // Dispatchers.IO: Uses the shared background thread pool.
   // SupervisorJob(): Ensures one failing task doesn't kill the whole daemon.
   val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + exceptionHandler)
+  val bridgeServiceName = "activity"
 
   var isLateInject = false
   var proxyServiceName = "serial"
@@ -67,6 +69,14 @@ object VectorDaemon {
       kotlin.system.exitProcess(1)
     }
 
+    // Setup Main Looper
+    Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND)
+    @Suppress("DEPRECATION") Looper.prepareMainLooper()
+
+    // Squat on the proxy service name immediately, which creates the early IPC channel of
+    // ApplicationService for our Zygisk module during system_server specialization.
+    SystemServerService.registerProxyService(proxyServiceName)
+
     // Start Environmental Daemons
     LogcatMonitor.start()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) Dex2OatServer.start()
@@ -75,27 +85,20 @@ object VectorDaemon {
     // Preload Framework DEX in the background
     scope.launch { FileSystem.getPreloadDex(ConfigCache.state.isDexObfuscateEnabled) }
 
-    // Setup Main Looper & System Services
-    Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND)
-    @Suppress("DEPRECATION") Looper.prepareMainLooper()
-
-    val systemServerService = SystemServerService(systemServerMaxRetry, proxyServiceName)
-    systemServerService.putBinderForSystemServer()
-
     // Initializes system frameworks inside the daemon process
     ActivityThread.systemMain()
     DdmHandleAppName.setAppName("org.matrix.vector.daemon", 0)
 
-    //  Wait for Android Core Services
+    // Wait for Android core services
     waitForSystemService("package")
-    waitForSystemService("activity")
+    waitForSystemService("activity") // current bridgeServiceName
     waitForSystemService(Context.USER_SERVICE)
     waitForSystemService(Context.APP_OPS_SERVICE)
 
     applyNotificationWorkaround()
 
-    // Inject Vector into system_server
-    sendToBridge(VectorService.asBinder(), isRestart = false, systemServerService)
+    // Setup IPC channel for applications by injecting DaemonService binder
+    sendToBridge(VectorService.asBinder(), false, systemServerMaxRetry)
 
     if (!ManagerService.isVerboseLog()) {
       LogcatMonitor.stopVerbose()
@@ -112,11 +115,12 @@ object VectorDaemon {
     }
   }
 
+  // The bridge is setup in `system_server` via Zygisk API
   @Suppress("DEPRECATION")
   private fun sendToBridge(
       binder: IBinder,
       isRestart: Boolean,
-      systemServerService: SystemServerService
+      restartRetry: Int,
   ) {
     check(Looper.myLooper() == Looper.getMainLooper()) {
       "sendToBridge MUST run on the main thread!"
@@ -126,12 +130,12 @@ object VectorDaemon {
 
     runCatching {
           var bridgeService: IBinder?
-          if (isRestart) Log.w(TAG, "System Server restarted...")
+          if (isRestart) Log.w(TAG, "system_server restarted...")
 
           while (true) {
-            bridgeService = ServiceManager.getService("activity")
+            bridgeService = ServiceManager.getService(bridgeServiceName)
             if (bridgeService?.pingBinder() == true) break
-            Log.i(TAG, "activity service not ready, waiting 1s...")
+            Log.i(TAG, "`$bridgeServiceName` service not ready, waiting 1s...")
             Thread.sleep(1000)
           }
 
@@ -142,10 +146,13 @@ object VectorDaemon {
                   Log.w(TAG, "System Server died! Clearing caches and re-injecting...")
                   bridgeService.unlinkToDeath(this, 0)
                   clearSystemCaches()
-                  systemServerService.putBinderForSystemServer()
+                  SystemServerService.binderDied() // Cleanup old references
+                  // Re-claim the service name immediately to ensure that when system_server
+                  // restarts, our proxy is already there for the Zygisk module to find.
+                  ServiceManager.addService(proxyServiceName, SystemServerService)
                   ManagerService.guard = null // Remove dead guard
                   Handler(Looper.getMainLooper()).post {
-                    sendToBridge(binder, isRestart = true, systemServerService)
+                    sendToBridge(binder, true, restartRetry - 1)
                   }
                 }
               }
@@ -170,13 +177,14 @@ object VectorDaemon {
             Thread.sleep(1000)
           }
 
-          if (success) Log.i(TAG, "Successfully injected Vector into system_server")
-          else {
-            Log.e(TAG, "Failed to inject Vector into system_server")
-            systemServerService.maybeRetryInject()
+          if (success) {
+            Log.i(TAG, "Successfully injected Vector IPC binder for applications.")
+          } else {
+            Log.e(TAG, "Failed to inject VectorService into system_server")
+            if (restartRetry > 0) restartSystemServer()
           }
         }
-        .onFailure { Log.e(TAG, "Error during System Server bridging", it) }
+        .onFailure { Log.e(TAG, "Error during injecting DaemonService", it) }
     Os.seteuid(1000)
   }
 
@@ -208,5 +216,16 @@ object VectorDaemon {
           }
         }
         .onFailure { Log.w(TAG, "Failed to clear system caches via reflection", it) }
+  }
+
+  fun restartSystemServer() {
+    Log.w(TAG, "Restarting system_server...")
+    val restartTarget =
+        if (Build.SUPPORTED_64_BIT_ABIS.isNotEmpty() && Build.SUPPORTED_32_BIT_ABIS.isNotEmpty()) {
+          "zygote_secondary"
+        } else {
+          "zygote"
+        }
+    SystemProperties.set("ctl.restart", restartTarget)
   }
 }
