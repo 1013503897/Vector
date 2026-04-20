@@ -314,6 +314,20 @@ object ConfigCache {
     return isAutoInclude
   }
 
+  fun getAutoIncludeModules(): List<String> {
+    val result = mutableListOf<String>()
+    ConfigCache.dbHelper.readableDatabase
+        .query("modules", arrayOf("module_pkg_name"), "auto_include = 1", null, null, null, null)
+        .use { cursor ->
+          val idx = cursor.getColumnIndexOrThrow("module_pkg_name")
+          while (cursor.moveToNext()) {
+            val pkgName = cursor.getString(idx)
+            if (pkgName != "lspd") result.add(pkgName)
+          }
+        }
+    return result
+  }
+
   fun getModulesForProcess(processName: String, uid: Int): List<Module> {
     ensureCacheReady()
     if (processName == "system_server") {

@@ -16,6 +16,7 @@ import android.util.Log
 import hidden.HiddenApiBridge
 import io.github.libxposed.service.IXposedScopeCallback
 import kotlinx.coroutines.launch
+import org.lsposed.lspd.models.Application
 import org.lsposed.lspd.service.IDaemonService
 import org.lsposed.lspd.service.ILSPApplicationService
 import org.matrix.vector.daemon.data.ConfigCache
@@ -275,10 +276,32 @@ object VectorService : IDaemonService.Stub() {
           isXposedModule =
               ModuleDatabase.updateModuleApkPath(
                   moduleName, ConfigCache.getModuleApkPath(appInfo), false)
-        } else if (ConfigCache.state.scopes.keys.any { it.uid == uid }) {
-          // If not a module, but it's an app that was previously a "scope" (target)
-          // for a module, we need to refresh the cache.
-          ConfigCache.requestCacheUpdate()
+        } else {
+          if (ConfigCache.state.scopes.keys.any { it.uid == uid }) {
+            // If not a module, but it's an app that was previously a "scope" (target)
+            // for a module, we need to refresh the cache.
+            ConfigCache.requestCacheUpdate()
+          }
+
+          if (action == Intent.ACTION_PACKAGE_ADDED &&
+              !intent.getBooleanExtra(Intent.EXTRA_REPLACING, false) &&
+              moduleName != null) {
+
+            ConfigCache.getAutoIncludeModules().forEach { xposedModule ->
+              val scopeList = ConfigCache.getModuleScope(xposedModule) ?: mutableListOf()
+
+              val newScope =
+                  Application().apply {
+                    this.packageName = moduleName
+                    this.userId = userId
+                  }
+
+              scopeList.add(newScope)
+              if (!ModuleDatabase.setModuleScope(xposedModule, scopeList)) {
+                Log.e(TAG, "Failed to auto-include $moduleName for $xposedModule")
+              }
+            }
+          }
         }
       }
       Intent.ACTION_UID_REMOVED -> {
@@ -353,7 +376,7 @@ object VectorService : IDaemonService.Stub() {
               val scopes = ConfigCache.getModuleScope(packageName) ?: mutableListOf()
               if (scopes.none { it.packageName == scopePackageName && it.userId == userId }) {
                 scopes.add(
-                    org.lsposed.lspd.models.Application().apply {
+                    Application().apply {
                       this.packageName = scopePackageName
                       this.userId = userId
                     })
