@@ -2,6 +2,7 @@ package org.matrix.vector.daemon.data
 
 import java.nio.file.Path
 import org.lsposed.lspd.models.Module
+import org.matrix.vector.daemon.BuildConfig
 
 data class ProcessScope(val processName: String, val uid: Int)
 
@@ -11,7 +12,7 @@ data class ProcessScope(val processName: String, val uid: Int)
  */
 data class DaemonState(
     // State non configurable for users
-    val isDexObfuscateEnabled: Boolean = true,
+    val isDexObfuscateEnabled: Boolean = !BuildConfig.DEBUG,
     // States initialized after system services are ready
     val isCacheReady: Boolean = false,
     val managerUid: Int = -1,
