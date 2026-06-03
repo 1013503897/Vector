@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -32,30 +33,43 @@
 
 #define PAGE_SZ 0x1000UL
 #define PAGE_INSN 1024              /* instructions in one 4 KiB page */
-#define CLONE_CAP 6144             /* 1024 insns can expand ~5x (mirrors pgtool.c) */
-#define KPM_MAX_PAGES 24           /* must not exceed the KPM's MAX_PG */
+#define CLONE_CAP 6144             /* characterize: one fn (<=2048 insns) can expand ~5x */
+#define MAX_RGN_PAGES 16           /* RV-2: must not exceed the KPM's MAX_RGN (covers all but a few huge fns) */
+#define RGN_INSN_MAX (MAX_RGN_PAGES * PAGE_INSN) /* 16384 region source insns */
+#define RGN_CLONE_CAP (RGN_INSN_MAX * 6)         /* clone scratch: ~5x expansion + headroom */
+#define KPM_MAX_REGIONS 16         /* must not exceed the KPM's MAX_PG */
 #define KPM_MAX_OV 8               /* must not exceed the KPM's MAX_OV */
 
 struct ov {
-    uint64_t off;   /* page-relative byte offset of the hooked entry */
+    uint64_t off;   /* REGION-relative byte offset of the hooked entry */
     void *replace;  /* the hooker */
     void *backup;   /* in-clone faithful copy of the target */
 };
 
-struct pgent {
+/* RV-2: a clean-bounded MULTI-PAGE region [base, end) cloned in one piece, so a
+ * function spanning a page boundary is wholly contained in the clone and RETs
+ * normally. Offsets are region-relative. offmap is malloc'd (region-sized). */
+struct rgn {
     int used;
-    uint64_t page;            /* page base of the trapped code page */
-    void *clone;              /* whole-page DBI clone (RX mmap) */
+    uint64_t base;            /* R_lo: region base page */
+    uint64_t end;             /* R_hi: base + npages*0x1000 (exclusive, a clean boundary) */
+    int npages;
+    void *clone;              /* whole-region DBI clone (RX mmap) */
     size_t clone_sz;          /* mmap size (page-rounded) */
-    uint32_t offmap[PAGE_INSN]; /* orig insn idx -> clone insn idx (read by the KPM) */
-    int nmap;
+    uint32_t *offmap;         /* malloc'd, nmap entries (read by the KPM via access_process_vm) */
+    int nmap;                 /* npages*1024 */
     struct ov ov[KPM_MAX_OV];
-    int nov;                  /* live overrides on this page */
+    int nov;                  /* live overrides in this region */
 };
 
-static struct pgent g_pages[KPM_MAX_PAGES];
-static uint32_t g_clonebuf[CLONE_CAP]; /* dbi scratch, reused under g_lock */
-static uint32_t g_scratch_omap[CLONE_CAP]; /* dbi offmap scratch (characterize), under g_lock */
+static struct rgn g_rgns[KPM_MAX_REGIONS];
+static uint32_t g_clonebuf[CLONE_CAP]; /* characterize dbi scratch, reused under g_lock */
+static uint32_t g_scratch_omap[CLONE_CAP]; /* characterize dbi offmap scratch, under g_lock */
+/* static .bss buffer handed to the KPM's access_process_vm (reused under g_lock): the
+ * KPM copies it into its own vmalloc immediately, so this need not persist. Scudo's
+ * high mmap-region heap pages are NOT GUP-readable by access_process_vm (got=0), but a
+ * .bss address is -- so the offmap to pass the KPM lives here, not on the malloc heap. */
+static uint32_t g_pass_offmap[RGN_INSN_MAX];
 static int g_pid = 0;
 static int g_inited = 0;      /* 1 = bridge verified live + this process is gated-in */
 static int g_init_failed = 0; /* 1 = gate rejected us or bridge was off (don't re-probe) */
@@ -181,48 +195,86 @@ static int ensure_init_locked(void)
     return 0;
 }
 
-static struct pgent *find_page_locked(uint64_t page)
+/* A page boundary `b` is clean if no function straddles it: the last word before b
+ * is a RET / unconditional tail-B / padding (NOP/0). Conservative heuristic -- if it
+ * misjudges "not clean" we just expand; if it wrongly judges "clean" the region would
+ * cut a function, which the clean-boundary scan is designed to avoid. */
+static int clean_boundary(uint64_t b)
 {
-    for (int i = 0; i < KPM_MAX_PAGES; i++)
-        if (g_pages[i].used && g_pages[i].page == page) return &g_pages[i];
+    uint32_t w = ((const uint32_t *)(uintptr_t)b)[-1]; /* word at b-4 */
+    if (w == 0xD65F03C0u) return 1;                  /* RET */
+    if (w == 0xD503201Fu || w == 0) return 1;        /* NOP / zero padding */
+    if ((w & 0xFC000000u) == 0x14000000u) return 1;  /* unconditional B (tail call) */
     return 0;
 }
 
-/* Build the whole-page DBI clone for `page` (mirrors pgtool.c make_clone). Returns
- * a populated, reusable registry entry, or NULL. */
-static struct pgent *make_page_locked(uint64_t page)
+/* Region whose [base,end) contains `target`. Because end is always a clean boundary,
+ * EVERY function starting in [base,end) also ends in it -- so a target found here is
+ * fully contained and reuse is always safe (append override). */
+static struct rgn *find_rgn_locked(uint64_t target)
 {
-    struct pgent *e = 0;
-    for (int i = 0; i < KPM_MAX_PAGES; i++)
-        if (!g_pages[i].used) { e = &g_pages[i]; break; }
-    if (!e) return 0; /* registry full */
+    for (int i = 0; i < KPM_MAX_REGIONS; i++)
+        if (g_rgns[i].used && target >= g_rgns[i].base && target < g_rgns[i].end) return &g_rgns[i];
+    return 0;
+}
 
-    /* bound LDR-literal pool reads to +/-8 MiB around the page (mapped segments) */
-    int n = dbi_recompile_range(page, (const uint32_t *)(uintptr_t)page, PAGE_INSN, g_clonebuf,
-                                CLONE_CAP, e->offmap, PAGE_INSN, (uintptr_t)(page - 0x800000),
-                                (uintptr_t)(page + 0x800000));
-    if (n < 0) return 0;
-
-    size_t sz = ((size_t)n * 4 + (PAGE_SZ - 1)) & ~(PAGE_SZ - 1);
-    void *clone = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (clone == MAP_FAILED) return 0;
-    memcpy(clone, g_clonebuf, (size_t)n * 4);
-    __builtin___clear_cache((char *)clone, (char *)clone + sz);
-    if (mprotect(clone, sz, PROT_READ | PROT_EXEC) != 0) {
-        munmap(clone, sz);
-        return 0;
+/* lowest existing-region base in (base,cap), or 0 -- so make_rgn never expands into
+ * (and overlaps) an already-armed region. */
+static uint64_t next_rgn_base_locked(uint64_t base, uint64_t cap)
+{
+    uint64_t lo = 0;
+    for (int i = 0; i < KPM_MAX_REGIONS; i++) {
+        if (!g_rgns[i].used) continue;
+        uint64_t rb = g_rgns[i].base;
+        if (rb > base && rb < cap && (lo == 0 || rb < lo)) lo = rb;
     }
+    return lo;
+}
 
-    e->page = page;
-    e->clone = clone;
-    e->clone_sz = sz;
-    e->nmap = PAGE_INSN;
-    e->nov = 0;
-    e->used = 1;
+/* Build a clean-bounded multi-page region clone covering `target`. R_lo = target's
+ * page; expand R_hi to the next clean boundary (capped at MAX_RGN_PAGES and at any
+ * existing region). Returns a populated entry, or NULL -> caller falls back to Dobby. */
+static struct rgn *make_rgn_locked(uint64_t target)
+{
+    uint64_t base = target & ~(PAGE_SZ - 1);
+    uint64_t cap = base + (uint64_t)MAX_RGN_PAGES * PAGE_SZ;
+    uint64_t collide = next_rgn_base_locked(base, cap);
+    if (collide) cap = collide; /* don't overlap an existing region */
+    uint64_t end = base + PAGE_SZ;
+    while (end < cap && !clean_boundary(end)) end += PAGE_SZ;
+    if (!clean_boundary(end)) return 0; /* no clean boundary in budget -> Dobby */
+
+    int npages = (int)((end - base) / PAGE_SZ);
+    int n = npages * PAGE_INSN;
+    uint32_t *offmap = malloc((size_t)n * 4);
+    uint32_t *scratch = malloc((size_t)RGN_CLONE_CAP * 4);
+    if (!offmap || !scratch) { free(offmap); free(scratch); return 0; }
+
+    /* bound LDR-literal pool reads to +/-8 MiB around the region (mapped segments) */
+    int csz = dbi_recompile_range(base, (const uint32_t *)(uintptr_t)base, n, scratch, RGN_CLONE_CAP,
+                                  offmap, n, (uintptr_t)(base - 0x800000), (uintptr_t)(end + 0x800000));
+    if (csz < 0) { free(offmap); free(scratch); return 0; }
+
+    size_t sz = ((size_t)csz * 4 + (PAGE_SZ - 1)) & ~(PAGE_SZ - 1);
+    void *clone = mmap(0, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (clone == MAP_FAILED) { free(offmap); free(scratch); return 0; }
+    memcpy(clone, scratch, (size_t)csz * 4);
+    free(scratch);
+    __builtin___clear_cache((char *)clone, (char *)clone + sz);
+    if (mprotect(clone, sz, PROT_READ | PROT_EXEC) != 0) { munmap(clone, sz); free(offmap); return 0; }
+
+    struct rgn *e = 0;
+    for (int i = 0; i < KPM_MAX_REGIONS; i++)
+        if (!g_rgns[i].used) { e = &g_rgns[i]; break; }
+    if (!e) { munmap(clone, sz); free(offmap); return 0; } /* registry full */
+    e->base = base; e->end = end; e->npages = npages;
+    e->clone = clone; e->clone_sz = sz;
+    e->offmap = offmap; e->nmap = n;
+    e->nov = 0; e->used = 1;
     return e;
 }
 
-static void add_ov_locked(struct pgent *e, uint64_t off, void *replace, void *backup)
+static void add_ov_locked(struct rgn *e, uint64_t off, void *replace, void *backup)
 {
     for (int i = 0; i < e->nov; i++)
         if (e->ov[i].off == off) { /* re-hook: update in place */
@@ -237,7 +289,7 @@ static void add_ov_locked(struct pgent *e, uint64_t off, void *replace, void *ba
     e->nov++;
 }
 
-static void remove_ov_locked(struct pgent *e, uint64_t off)
+static void remove_ov_locked(struct rgn *e, uint64_t off)
 {
     for (int i = 0; i < e->nov; i++)
         if (e->ov[i].off == off) {
@@ -272,24 +324,34 @@ void *kpm_inline_hooker(void *target, void *hooker)
     }
 
     uintptr_t t = (uintptr_t)target;
-    uint64_t page = (uint64_t)(t & ~(PAGE_SZ - 1));
-    uint64_t off = (uint64_t)(t & (PAGE_SZ - 1));
+    struct rgn *e = find_rgn_locked(t); /* reuse the region if target is inside one (always fits) */
+    if (!e) e = make_rgn_locked(t);
+    if (!e) {
+#ifdef KPM_DEBUG
+        fprintf(stderr, "[kpm] make_rgn NULL for target=0x%lx\n", (unsigned long)t);
+#endif
+        goto out; /* >MAX_RGN_PAGES with no clean boundary, or alloc failure -> Dobby */
+    }
 
-    struct pgent *e = find_page_locked(page);
-    if (!e) e = make_page_locked(page);
-    if (!e) goto out;
+    uint64_t roff = t - e->base; /* region-relative offset */
+    backup = (char *)e->clone + (size_t)e->offmap[roff / 4] * 4;
 
-    backup = (char *)e->clone + (size_t)e->offmap[off / 4] * 4;
+    /* hand the KPM a .bss copy of the offmap (its heap original isn't GUP-readable) */
+    memcpy(g_pass_offmap, e->offmap, (size_t)e->nmap * 4);
 
     char cmd[192], out[256];
     snprintf(cmd, sizeof cmd, "pghook %d 0x%lx 0x%lx 0x%lx %lu 0x%lx 0x%lx", g_pid,
-             (unsigned long)page, (unsigned long)(uintptr_t)e->clone,
-             (unsigned long)(uintptr_t)e->offmap, (unsigned long)PAGE_INSN, (unsigned long)off,
+             (unsigned long)e->base, (unsigned long)(uintptr_t)e->clone,
+             (unsigned long)(uintptr_t)g_pass_offmap, (unsigned long)e->nmap, (unsigned long)roff,
              (unsigned long)(uintptr_t)hooker);
     bridge_cmd(cmd, out, sizeof out);
+#ifdef KPM_DEBUG
+    fprintf(stderr, "[kpm] rgn base=0x%lx npages=%d clone=%p nmap=%d roff=0x%lx cmd=[%s] reply=[%s]\n",
+            (unsigned long)e->base, e->npages, e->clone, e->nmap, (unsigned long)roff, cmd, out);
+#endif
     if (!reply_ok(out)) { backup = 0; goto out; }
 
-    add_ov_locked(e, off, hooker, backup);
+    add_ov_locked(e, roff, hooker, backup);
 
 out:
     pthread_mutex_unlock(&g_lock);
@@ -303,18 +365,16 @@ int kpm_inline_unhooker(void *func)
     if (!g_inited) goto out;
 
     uintptr_t f = (uintptr_t)func;
-    uint64_t page = (uint64_t)(f & ~(PAGE_SZ - 1));
-    uint64_t off = (uint64_t)(f & (PAGE_SZ - 1));
+    struct rgn *e = find_rgn_locked(f);
+    if (!e) goto out; /* not a KPM-hooked function -> caller uses Dobby */
+    uint64_t roff = f - e->base; /* region-relative */
 
     char cmd[128], out[256];
-    snprintf(cmd, sizeof cmd, "pgunhook %d 0x%lx 0x%lx", g_pid, (unsigned long)page,
-             (unsigned long)off);
+    snprintf(cmd, sizeof cmd, "pgunhook %d 0x%lx 0x%lx", g_pid, (unsigned long)e->base,
+             (unsigned long)roff);
     bridge_cmd(cmd, out, sizeof out);
     ok = reply_ok(out);
-    if (ok) {
-        struct pgent *e = find_page_locked(page);
-        if (e) remove_ov_locked(e, off); /* keep the clone mapped until shutdown */
-    }
+    if (ok) remove_ov_locked(e, roff); /* keep the clone/offmap until shutdown */
 
 out:
     pthread_mutex_unlock(&g_lock);
@@ -324,10 +384,11 @@ out:
 void kpm_hook_shutdown(void)
 {
     pthread_mutex_lock(&g_lock);
-    for (int i = 0; i < KPM_MAX_PAGES; i++) {
-        if (!g_pages[i].used) continue;
-        if (g_pages[i].clone) munmap(g_pages[i].clone, g_pages[i].clone_sz);
-        memset(&g_pages[i], 0, sizeof(g_pages[i]));
+    for (int i = 0; i < KPM_MAX_REGIONS; i++) {
+        if (!g_rgns[i].used) continue;
+        if (g_rgns[i].clone) munmap(g_rgns[i].clone, g_rgns[i].clone_sz);
+        free(g_rgns[i].offmap);
+        memset(&g_rgns[i], 0, sizeof(g_rgns[i]));
     }
     pthread_mutex_unlock(&g_lock);
 }
