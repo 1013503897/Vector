@@ -9,3 +9,5 @@
 build
 /captures
 bin/
+# local NDK/gradle build logs
+_build*.log
