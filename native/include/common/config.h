@@ -5,6 +5,12 @@
  * @brief Compile-time constants, version information, and platform-specific configurations.
  */
 
+// Stringify a -D macro value. The build passes string-valued defines UNQUOTED
+// (e.g. -DVERSION_NAME=1.0) because embedding quotes via cmake flags is not
+// portable to the Windows toolchain; we add the quotes here at the use site.
+#define VEC_STR_(x) #x
+#define VEC_STR(x) VEC_STR_(x)
+
 namespace vector::native {
 
 [[nodiscard]] constexpr bool IsDebugBuild() {
@@ -46,6 +52,6 @@ inline constexpr auto kLinkerPath = "/linker";
 const int kVersionCode = VERSION_CODE;
 
 /// The version name of the library, populated by the build system.
-const char *const kVersionName = VERSION_NAME;
+const char *const kVersionName = VEC_STR(VERSION_NAME);
 
 }  // namespace vector::native
