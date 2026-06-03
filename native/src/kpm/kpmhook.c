@@ -11,12 +11,15 @@
 // separately). Original execution is rerouted into the clone by the kernel fault
 // router; the KPM only reads our offmap, never the clone bytes.
 
+#include <android/log.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include "dbi.h"
@@ -52,10 +55,94 @@ struct pgent {
 
 static struct pgent g_pages[KPM_MAX_PAGES];
 static uint32_t g_clonebuf[CLONE_CAP]; /* dbi scratch, reused under g_lock */
+static uint32_t g_scratch_omap[CLONE_CAP]; /* dbi offmap scratch (characterize), under g_lock */
 static int g_pid = 0;
-static int g_inited = 0;      /* 1 = bridge verified live */
-static int g_init_failed = 0; /* 1 = probed once and the bridge was off (don't re-probe) */
+static int g_inited = 0;      /* 1 = bridge verified live + this process is gated-in */
+static int g_init_failed = 0; /* 1 = gate rejected us or bridge was off (don't re-probe) */
+static int g_force_enable = 0; /* standalone/test bypass of the process gate (NOT used by Vector) */
+static int g_mode_read = 0;
+static int g_characterize = 0; /* 1 = dry-run: log a span census, arm nothing */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define KPM_LOG_TAG "kpmhook"
+
+/* Process gate: engage the KPM backend only in the process named by the system
+ * property `persist.kpmhook.target` (matched against /proc/self/cmdline), so that
+ * system_server / zygote / every other injected process stay on pure Dobby. The
+ * standalone test harness calls kpm_hook_force_enable() to bypass this (it has no
+ * Dobby fallback and runs its own dedicated process). */
+static int proc_is_target(void)
+{
+    if (g_force_enable) return 1;
+    char cmd[256];
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
+    close(fd);
+    if (r <= 0) return 0;
+    cmd[r] = 0; /* args are NUL-separated; the first token is the process name */
+#ifdef KPM_RV0_TARGET
+    /* compile-time target: SELinux-proof (an untrusted_app cannot read a custom
+     * persist.* prop on modern Android). Defined only for the RV-0 characterize build. */
+    if (strcmp(cmd, KPM_RV0_TARGET) == 0) return 1;
+#endif
+    char target[PROP_VALUE_MAX];
+    if (__system_property_get("persist.kpmhook.target", target) > 0 && strcmp(cmd, target) == 0)
+        return 1;
+    return 0;
+}
+
+/* Whether to run the dry-run census instead of arming hooks. The RV-0 build forces
+ * it on at compile time (SELinux-proof -- an injected app cannot read a custom
+ * persist.* prop); otherwise it is opt-in via persist.kpmhook.mode=characterize. */
+static int is_characterize(void)
+{
+    if (!g_mode_read) {
+#ifdef KPM_RV0_TARGET
+        g_characterize = 1; /* RV-0 build: always dry-run -- arm nothing, just census */
+#else
+        char mode[PROP_VALUE_MAX];
+        g_characterize =
+            (__system_property_get("persist.kpmhook.mode", mode) > 0 && strcmp(mode, "characterize") == 0);
+#endif
+        g_mode_read = 1;
+    }
+    return g_characterize;
+}
+
+/* Instruction count from `entry` to the first RET / unconditional tail B (heuristic
+ * function end -- enough for a page-span census). Bounded read to limit over-read
+ * past the .text segment. */
+static int fn_len_insns(uintptr_t entry)
+{
+    const uint32_t *p = (const uint32_t *)entry;
+    const int cap = 2048; /* 8 KiB scan cap */
+    for (int i = 0; i < cap; i++) {
+        uint32_t w = p[i];
+        if (w == 0xD65F03C0u) return i + 1;             /* RET */
+        if ((w & 0xFC000000u) == 0x14000000u) return i + 1; /* unconditional B (tail) -- heuristic end */
+    }
+    return cap;
+}
+
+/* Dry-run census for one LSPlant target: how far the function reaches and whether it
+ * spans page boundaries (the whole-page clone breaks on page-spanning funcs). Arms
+ * nothing; logs one logcat line under tag "kpmhook". */
+static void characterize_target(void *target)
+{
+    uintptr_t t = (uintptr_t)target;
+    uint64_t page = (uint64_t)(t & ~(PAGE_SZ - 1));
+    uint64_t off = (uint64_t)(t & (PAGE_SZ - 1));
+    int len = fn_len_insns(t);
+    uint64_t end = t + (uint64_t)len * 4;
+    int pages = (int)((end - 1) / PAGE_SZ - t / PAGE_SZ + 1);
+    int rc = dbi_recompile(t, (const uint32_t *)t, len + 4, g_clonebuf, CLONE_CAP, g_scratch_omap,
+                           CLONE_CAP);
+    __android_log_print(ANDROID_LOG_INFO, KPM_LOG_TAG,
+                        "census target=%p page=0x%lx off=0x%lx len=%d end=0x%lx pages=%d dbi_rc=%d%s",
+                        target, (unsigned long)page, (unsigned long)off, len, (unsigned long)end,
+                        pages, rc, pages > 1 ? " SPANS" : "");
+}
 
 /* Run a KPM command through the bridge. Fills `out` (NUL-terminated). Returns the
  * KPM rc. If the bridge is OFF this is a real personality() call: it would corrupt
@@ -76,7 +163,11 @@ static int reply_ok(const char *out) { return out[0] == 'o' && out[1] == 'k'; }
 static int ensure_init_locked(void)
 {
     if (g_inited) return 0;
-    if (g_init_failed) return -1; /* probed once, bridge was off -- don't re-clobber personality */
+    if (g_init_failed) return -1; /* gated out or bridge off -- don't re-probe/re-clobber personality */
+    if (!proc_is_target()) {      /* process gate: only the named test process engages the KPM */
+        g_init_failed = 1;
+        return -1;
+    }
     unsigned long orig = (unsigned long)syscall(__NR_personality, 0xffffffffUL); /* query only */
     char out[128];
     bridge_cmd("probe", out, sizeof out);
@@ -156,6 +247,8 @@ static void remove_ov_locked(struct pgent *e, uint64_t off)
         }
 }
 
+void kpm_hook_force_enable(void) { g_force_enable = 1; }
+
 int kpm_hook_init(void)
 {
     pthread_mutex_lock(&g_lock);
@@ -169,6 +262,14 @@ void *kpm_inline_hooker(void *target, void *hooker)
     void *backup = 0;
     pthread_mutex_lock(&g_lock);
     if (ensure_init_locked() != 0) goto out;
+
+    /* dry-run characterize mode: measure the function's page-span, arm nothing,
+     * return NULL so the caller (Vector) falls back to Dobby and the app stays
+     * functional. This is the crash-safe RV-0 path. */
+    if (is_characterize()) {
+        characterize_target(target);
+        goto out;
+    }
 
     uintptr_t t = (uintptr_t)target;
     uint64_t page = (uint64_t)(t & ~(PAGE_SZ - 1));

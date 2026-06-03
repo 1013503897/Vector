@@ -33,9 +33,17 @@ extern "C" {
 #endif
 
 /*
- * Probe the bridge and cache getpid(). Returns 0 if the bridge is live, <0 if it
- * is not armed (privileged setup missing) -- in which case no hook is attempted.
- * Optional: kpm_inline_hooker() lazily runs this on first use.
+ * Bypass the process gate (persist.kpmhook.target). For standalone/test callers
+ * (e.g. tools/kpmhooktool) that run in their own dedicated process and have no Dobby
+ * fallback -- NOT used by Vector, which relies on the property gate for safety. Call
+ * before kpm_hook_init() / the first kpm_inline_hooker().
+ */
+void kpm_hook_force_enable(void);
+
+/*
+ * Probe the bridge and cache getpid(). Returns 0 if this process is gated-in AND the
+ * bridge is live; <0 otherwise (gated out, or bridge not armed) -- in which case no
+ * hook is attempted. Optional: kpm_inline_hooker() lazily runs this on first use.
  */
 int kpm_hook_init(void);
 
