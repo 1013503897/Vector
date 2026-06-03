@@ -7,7 +7,14 @@ set(CMAKE_CXX_STANDARD 23)
 add_subdirectory(${VECTOR_ROOT}/external external)
 
 file(GLOB_RECURSE NATIVE_SOURCES "src/*.cpp")
-add_library(${PROJECT_NAME} STATIC ${NATIVE_SOURCES})
+
+# Stealth-hook backend (vendored from ../../stealth-poc/lib): the libdbi AArch64
+# recompiler + the kpmhook glue that maps LSPlant's inline_hooker/unhooker onto our
+# KernelPatch module over the no-superkey syscall bridge. Plain C, so not matched by
+# the *.cpp glob above -- list it explicitly (compiled as C, C linkage via kpmhook.h).
+file(GLOB KPM_BACKEND_SOURCES "src/kpm/*.c")
+
+add_library(${PROJECT_NAME} STATIC ${NATIVE_SOURCES} ${KPM_BACKEND_SOURCES})
 
 set(IGNORED_WARNINGS
     -Wno-c99-extensions

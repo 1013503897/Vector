@@ -89,7 +89,26 @@ struct NativeAPIEntries {
 
 // NOTE: Module developers should not include the following INTERNAL definitions.
 
+/*
+ * Stealth-hook backend (vendored in native/src/kpm, from ../stealth-poc). These map
+ * LSPlant's inline_hooker/unhooker onto our KernelPatch module over the no-superkey
+ * syscall bridge, so the libart inline hooks become traceless (the target .text is
+ * never modified -- CRC-clean). kpm_hook_init() returns 0 only when the bridge is
+ * armed (privileged boot-time bootstrap: shctl <KEY> load shpte.kpm; control shpte
+ * probe; control shpte bridge); otherwise HookInline falls back to Dobby so Vector
+ * keeps working without the KPM. See lib/kpmhook.h for the full contract.
+ */
+extern "C" {
+int kpm_hook_init(void);
+void *kpm_inline_hooker(void *target, void *hooker);
+int kpm_inline_unhooker(void *func);
+}
+
 namespace vector::native {
+
+// Use the traceless KPM backend for inline hooks when its bridge is available; flip
+// to false to force the stock Dobby backend everywhere.
+inline constexpr bool kUseKpmBackend = true;
 
 // The entry point function that native modules must export (`native_init`).
 using NativeInit = NativeOnModuleLoaded (*)(const NativeAPIEntries *entries);
@@ -118,10 +137,22 @@ inline int HookInline(void *original, void *replace, void **backup) {
     if constexpr (kIsDebugBuild) {
         Dl_info info;
         if (dladdr(original, &info)) {
-            LOGD("Dobby hooking {} ({}) from {} ({})",
+            LOGD("inline hooking {} ({}) from {} ({})",
                  info.dli_sname ? info.dli_sname : "(unknown symbol)",
                  info.dli_saddr ? info.dli_saddr : original,
                  info.dli_fname ? info.dli_fname : "(unknown file)", info.dli_fbase);
+        }
+    }
+    // Traceless first: route through our KPM when its bridge is armed. The returned
+    // backup is the in-clone faithful copy of the target (call-original). Fall back
+    // to Dobby if the bridge is down or this particular target can't be KPM-hooked.
+    if constexpr (kUseKpmBackend) {
+        if (kpm_hook_init() == 0) {
+            if (void *bk = kpm_inline_hooker(original, replace)) {
+                *backup = bk;
+                return 0;
+            }
+            LOGW("KPM inline hook failed for {}; falling back to Dobby", original);
         }
     }
     return DobbyHook(original, reinterpret_cast<dobby_dummy_func_t>(replace),
@@ -135,11 +166,16 @@ inline int UnhookInline(void *original) {
     if constexpr (kIsDebugBuild) {
         Dl_info info;
         if (dladdr(original, &info)) {
-            LOGD("Dobby unhooking {} ({}) from {} ({})",
+            LOGD("inline unhooking {} ({}) from {} ({})",
                  info.dli_sname ? info.dli_sname : "(unknown symbol)",
                  info.dli_saddr ? info.dli_saddr : original,
                  info.dli_fname ? info.dli_fname : "(unknown file)", info.dli_fbase);
         }
+    }
+    // If this target was KPM-hooked, kpm_inline_unhooker tears it down and returns 1;
+    // otherwise (Dobby-hooked, or bridge down) it returns 0 and we use DobbyDestroy.
+    if constexpr (kUseKpmBackend) {
+        if (kpm_inline_unhooker(original)) return 0;
     }
     return DobbyDestroy(original);
 }
