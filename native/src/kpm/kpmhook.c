@@ -25,11 +25,14 @@
 
 #include "dbi.h"
 #include "kpmhook.h"
+#define KPM_TARGET_UID 2000
 
 #define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" -- matches kpm/shpte.c */
-#ifndef __NR_personality
-#define __NR_personality 92 /* arm64 asm-generic */
-#endif
+/* Bridge carrier syscall = sysinfo (arm64 #179), NOT personality: Android's app
+ * seccomp filter arg-filters personality() (blocks our magic arg with ERRNO), so the
+ * personality bridge is unreachable from real zygote-forked app processes. sysinfo is
+ * seccomp-allowed with arbitrary args and rarely called. Must match kpm/shpte.c BRIDGE_NR. */
+#define BRIDGE_NR 179
 
 #define PAGE_SZ 0x1000UL
 #define PAGE_INSN 1024              /* instructions in one 4 KiB page */
@@ -95,10 +98,22 @@ static int proc_is_target(void)
     close(fd);
     if (r <= 0) return 0;
     cmd[r] = 0; /* args are NUL-separated; the first token is the process name */
+#ifdef KPM_TARGET_UID
+    /* At LSPlant::Init/HookInline time the cmdline is still "zygote64" (the app name is
+     * set later, in the app's main), so a cmdline gate can't identify the process there.
+     * The UID is already specialized, though -- so gate on it (e.g. 2000 = the shell-UID
+     * parasitic LSPosed manager host). */
+    if ((int)getuid() == KPM_TARGET_UID) return 1;
+#endif
 #ifdef KPM_RV0_TARGET
     /* compile-time target: SELinux-proof (an untrusted_app cannot read a custom
      * persist.* prop on modern Android). Defined only for the RV-0 characterize build. */
     if (strcmp(cmd, KPM_RV0_TARGET) == 0) return 1;
+#endif
+#ifdef KPM_TARGET
+    /* compile-time target for REAL hooking (no characterize) -- gate the KPM region
+     * clones to this one process; system_server / everything else stays on Dobby. */
+    if (strcmp(cmd, KPM_TARGET) == 0) return 1;
 #endif
     char target[PROP_VALUE_MAX];
     if (__system_property_get("persist.kpmhook.target", target) > 0 && strcmp(cmd, target) == 0)
@@ -158,35 +173,32 @@ static void characterize_target(void *target)
                         pages, rc, pages > 1 ? " SPANS" : "");
 }
 
-/* Run a KPM command through the bridge. Fills `out` (NUL-terminated). Returns the
- * KPM rc. If the bridge is OFF this is a real personality() call: it would corrupt
- * the process personality, so callers must only use this after kpm_hook_init()
- * confirmed the bridge is armed. */
+/* Run a KPM command through the bridge. Fills `out` (NUL-terminated). Returns the KPM
+ * rc. If the bridge is OFF this is a real sysinfo() call with a bogus struct pointer
+ * (BRIDGE_MAGIC) -> harmless EFAULT, no side effects (unlike personality, which would
+ * have clobbered the process persona). */
 static long bridge_cmd(const char *cmd, char *out, size_t outlen)
 {
     if (out && outlen) out[0] = 0;
-    return syscall(__NR_personality, BRIDGE_MAGIC, cmd, (long)strlen(cmd) + 1, out, (long)outlen);
+    return syscall(BRIDGE_NR, BRIDGE_MAGIC, cmd, (long)strlen(cmd) + 1, out, (long)outlen);
 }
 
 static int reply_ok(const char *out) { return out[0] == 'o' && out[1] == 'k'; }
 
-/* Init under g_lock. Probe the bridge without corrupting personality if it's off:
- * query the current persona first; if our magic probe is swallowed by the KPM the
- * real syscall never runs (persona unchanged); if it is NOT swallowed (bridge off)
- * `out` stays empty and we restore the persona we clobbered. */
+/* Init under g_lock. Probe the bridge: if it is armed the KPM swallows our magic
+ * sysinfo() and fills `out`; if not, the real sysinfo(BRIDGE_MAGIC,...) EFAULTs and
+ * `out` stays empty (no cleanup needed). */
 static int ensure_init_locked(void)
 {
     if (g_inited) return 0;
-    if (g_init_failed) return -1; /* gated out or bridge off -- don't re-probe/re-clobber personality */
+    if (g_init_failed) return -1; /* gated out or bridge off -- don't re-probe */
     if (!proc_is_target()) {      /* process gate: only the named test process engages the KPM */
         g_init_failed = 1;
         return -1;
     }
-    unsigned long orig = (unsigned long)syscall(__NR_personality, 0xffffffffUL); /* query only */
     char out[128];
     bridge_cmd("probe", out, sizeof out);
     if (out[0] == 0) {
-        syscall(__NR_personality, orig); /* bridge off: undo the personality clobber */
         g_init_failed = 1;
         return -1;
     }
