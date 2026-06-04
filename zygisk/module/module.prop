@@ -2,6 +2,6 @@ id=zygisk_vector
 name=Vector
 version=${versionName} (${versionCode})
 versionCode=${versionCode}
-author=JingMatrix
+author=wxy
 description=A modern, Xposed-compatible framework for Android application hooking. (Android 8.1 ~ 16)
 updateJson=https://raw.githubusercontent.com/JingMatrix/LSPosed/master/zygisk/update.json
