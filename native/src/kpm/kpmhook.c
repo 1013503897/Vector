@@ -37,8 +37,8 @@
 #define PAGE_SZ 0x1000UL
 #define PAGE_INSN 1024              /* instructions in one 4 KiB page */
 #define CLONE_CAP 6144             /* characterize: one fn (<=2048 insns) can expand ~5x */
-#define MAX_RGN_PAGES 16           /* RV-2: must not exceed the KPM's MAX_RGN (covers all but a few huge fns) */
-#define RGN_INSN_MAX (MAX_RGN_PAGES * PAGE_INSN) /* 16384 region source insns */
+#define MAX_RGN_PAGES 64           /* RV-2: must not exceed the KPM's MAX_RGN (64: reach farther clean boundaries) */
+#define RGN_INSN_MAX (MAX_RGN_PAGES * PAGE_INSN) /* 65536 region source insns */
 #define RGN_CLONE_CAP (RGN_INSN_MAX * 6)         /* clone scratch: ~5x expansion + headroom */
 #define KPM_MAX_REGIONS 16         /* must not exceed the KPM's MAX_PG */
 #define KPM_MAX_OV 8               /* must not exceed the KPM's MAX_OV */
