@@ -41,6 +41,16 @@ extern "C" {
 void kpm_hook_force_enable(void);
 
 /*
+ * Tell the KPM process gate the real package/process name. Vector calls this from
+ * postAppSpecialize (where the app's nice_name is known) BEFORE LSPlant installs its
+ * inline hooks -- at hook time /proc/self/cmdline is still "zygote64", so the backend
+ * cannot identify the app on its own. Only the build's injection target then engages
+ * the KPM (everything else stays on Dobby). Standalone test callers may skip this (the
+ * gate falls back to /proc/self/cmdline). Call before kpm_hook_init() / the first hooker.
+ */
+void kpm_hook_set_process_name(const char *name);
+
+/*
  * Probe the bridge and cache getpid(). Returns 0 if this process is gated-in AND the
  * bridge is live; <0 otherwise (gated out, or bridge not armed) -- in which case no
  * hook is attempted. Optional: kpm_inline_hooker() lazily runs this on first use.

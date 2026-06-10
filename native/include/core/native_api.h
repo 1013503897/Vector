@@ -99,6 +99,10 @@ struct NativeAPIEntries {
  * keeps working without the KPM. See lib/kpmhook.h for the full contract.
  */
 extern "C" {
+// Identify the app to the KPM process gate before LSPlant installs its inline hooks
+// (at hook time /proc/self/cmdline is still "zygote64"). Only the build's injection
+// target then engages the KPM; every other process stays on Dobby.
+void kpm_hook_set_process_name(const char *name);
 int kpm_hook_init(void);
 void *kpm_inline_hooker(void *target, void *hooker);
 int kpm_inline_unhooker(void *func);

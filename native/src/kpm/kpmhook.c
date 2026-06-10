@@ -25,7 +25,20 @@
 
 #include "dbi.h"
 #include "kpmhook.h"
+
+/* Stringize an unquoted -D string define: Vector's build passes
+ * -DINJECTED_PACKAGE_NAME=com.android.shell unquoted (see common/config.h VEC_STR). */
+#define KPM_STR_(x) #x
+#define KPM_STR(x) KPM_STR_(x)
+
+/* Gate the KPM backend to the build's injection target UID. INJECTED_PACKAGE_UID is the
+ * -D define Vector's build passes (com.android.shell -> 2000); fall back to 2000 when
+ * this TU is built standalone without it (e.g. tools/kpmhooktool). */
+#ifdef INJECTED_PACKAGE_UID
+#define KPM_TARGET_UID INJECTED_PACKAGE_UID
+#else
 #define KPM_TARGET_UID 2000
+#endif
 
 #define BRIDGE_MAGIC 0x5348505442524447ULL /* "SHPTBRDG" -- matches kpm/shpte.c */
 /* Bridge carrier syscall = sysinfo (arm64 #179), NOT personality: Android's app
@@ -77,46 +90,61 @@ static int g_pid = 0;
 static int g_inited = 0;      /* 1 = bridge verified live + this process is gated-in */
 static int g_init_failed = 0; /* 1 = gate rejected us or bridge was off (don't re-probe) */
 static int g_force_enable = 0; /* standalone/test bypass of the process gate (NOT used by Vector) */
+static char g_proc_name[128];  /* real package/process name Vector passes via kpm_hook_set_process_name */
 static int g_mode_read = 0;
 static int g_characterize = 0; /* 1 = dry-run: log a span census, arm nothing */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 #define KPM_LOG_TAG "kpmhook"
 
-/* Process gate: engage the KPM backend only in the process named by the system
- * property `persist.kpmhook.target` (matched against /proc/self/cmdline), so that
- * system_server / zygote / every other injected process stay on pure Dobby. The
- * standalone test harness calls kpm_hook_force_enable() to bypass this (it has no
- * Dobby fallback and runs its own dedicated process). */
+/* Process gate: engage the KPM backend only in the build's injection target. The process
+ * is identified by the name Vector hands us via kpm_hook_set_process_name() (the real
+ * nice_name, known at postAppSpecialize) -- at LSPlant::Init/HookInline time
+ * /proc/self/cmdline is still "zygote64", so it can't identify the app there. When no name
+ * was passed (standalone harness, or the system_server path that never sets one), fall back
+ * to /proc/self/cmdline. Match candidates: the build's INJECTED_PACKAGE_NAME / UID
+ * (compile-time, SELinux-proof), the legacy KPM_TARGET / KPM_RV0_TARGET test targets, and
+ * the runtime `persist.kpmhook.target` prop. Everything else (system_server / zygote / other
+ * injected apps) stays on pure Dobby. kpm_hook_force_enable() bypasses the gate for the
+ * standalone harness (no Dobby fallback, dedicated process). */
 static int proc_is_target(void)
 {
     if (g_force_enable) return 1;
+
+    /* Prefer Vector's passed name; else fall back to /proc/self/cmdline. */
     char cmd[256];
-    int fd = open("/proc/self/cmdline", O_RDONLY);
-    if (fd < 0) return 0;
-    ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
-    close(fd);
-    if (r <= 0) return 0;
-    cmd[r] = 0; /* args are NUL-separated; the first token is the process name */
+    const char *name = g_proc_name;
+    if (!name[0]) {
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return 0;
+        ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
+        close(fd);
+        if (r <= 0) return 0;
+        cmd[r] = 0; /* args are NUL-separated; the first token is the process name */
+        name = cmd;
+    }
+
 #ifdef KPM_TARGET_UID
-    /* At LSPlant::Init/HookInline time the cmdline is still "zygote64" (the app name is
-     * set later, in the app's main), so a cmdline gate can't identify the process there.
-     * The UID is already specialized, though -- so gate on it (e.g. 2000 = the shell-UID
-     * parasitic LSPosed manager host). */
+    /* UID fallback: the injected host is UID-specialized at hook time even when no name was
+     * passed (e.g. 2000 = the shell-UID parasitic LSPosed manager host). */
     if ((int)getuid() == KPM_TARGET_UID) return 1;
+#endif
+#ifdef INJECTED_PACKAGE_NAME
+    /* the build's injection target (compile-time, SELinux-proof) */
+    if (strcmp(name, KPM_STR(INJECTED_PACKAGE_NAME)) == 0) return 1;
 #endif
 #ifdef KPM_RV0_TARGET
     /* compile-time target: SELinux-proof (an untrusted_app cannot read a custom
      * persist.* prop on modern Android). Defined only for the RV-0 characterize build. */
-    if (strcmp(cmd, KPM_RV0_TARGET) == 0) return 1;
+    if (strcmp(name, KPM_RV0_TARGET) == 0) return 1;
 #endif
 #ifdef KPM_TARGET
     /* compile-time target for REAL hooking (no characterize) -- gate the KPM region
      * clones to this one process; system_server / everything else stays on Dobby. */
-    if (strcmp(cmd, KPM_TARGET) == 0) return 1;
+    if (strcmp(name, KPM_TARGET) == 0) return 1;
 #endif
     char target[PROP_VALUE_MAX];
-    if (__system_property_get("persist.kpmhook.target", target) > 0 && strcmp(cmd, target) == 0)
+    if (__system_property_get("persist.kpmhook.target", target) > 0 && strcmp(name, target) == 0)
         return 1;
     return 0;
 }
@@ -312,6 +340,18 @@ static void remove_ov_locked(struct rgn *e, uint64_t off)
 }
 
 void kpm_hook_force_enable(void) { g_force_enable = 1; }
+
+void kpm_hook_set_process_name(const char *name)
+{
+    pthread_mutex_lock(&g_lock);
+    if (name && name[0]) {
+        strncpy(g_proc_name, name, sizeof(g_proc_name) - 1);
+        g_proc_name[sizeof(g_proc_name) - 1] = 0;
+    } else {
+        g_proc_name[0] = 0;
+    }
+    pthread_mutex_unlock(&g_lock);
+}
 
 int kpm_hook_init(void)
 {

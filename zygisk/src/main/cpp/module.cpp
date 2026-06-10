@@ -337,6 +337,11 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     }
     close(dex_fd);  // The FD is duplicated by mmap, we can close it now.
 
+    // Tell the KPM gate which app this is BEFORE LSPlant installs its inline hooks --
+    // at hook time /proc/self/cmdline is still "zygote64". Only the build's injection
+    // target engages the traceless backend; every other process falls back to Dobby.
+    kpm_hook_set_process_name(nice_name_str.get());
+
     // Initialize ART hooks via the native library.
     this->InitArtHooker(env_, init_info_);
     // Initialize JNI hooks via the native library.
