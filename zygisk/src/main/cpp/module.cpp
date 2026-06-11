@@ -67,7 +67,8 @@ static bool QcIsTraceable(const void *qc) {
             a >= lo && a < hi) {
             aot = perms[2] == 'x' &&
                   (strstr(path, ".oat") || strstr(path, ".odex") || strstr(path, ".art") ||
-                   strstr(path, "/oat/"));
+                   strstr(path, "/oat/") || strstr(path, "jit-code-cache") ||
+                   strstr(path, "jit-cache"));  // JIT body (post force-compile) is also a unique trap target
             break;
         }
     }
@@ -78,6 +79,47 @@ static bool QcIsTraceable(const void *qc) {
     // word (e.g. RET=0xD65F03C0 -> ~0x165F03C0 masked), far above any real method.
     uint32_t code_size = *reinterpret_cast<const uint32_t *>(a - 4) & 0x3FFFFFFFu;
     return code_size >= 8 && code_size <= 0x80000;
+}
+
+// M-C: force the JIT to give an nterp/interpreted method its OWN compiled body, so the traceless
+// path has a unique region to trap (instead of falling back to the detectable in-place hook).
+// Called from DoHook BEFORE the suspend (the JIT compiles on a background thread). entry_point is
+// at +24 on this device. Resolves art::Runtime::instance_, Runtime::GetJit, and
+// Jit::EnqueueOptimizedCompilation; enqueues an optimized compile and polls until the method gains
+// a unique compiled body or a ~1s timeout (then it stays nterp and DoHook takes the in-place path).
+static void ForceCompileMethod(void *method, void *thread) {
+    if (!method) return;
+    void *qc = *reinterpret_cast<void **>(reinterpret_cast<char *>(method) + 24);
+    if (QcIsTraceable(qc)) return;  // already has a unique compiled body (AOT/JIT)
+
+    using Sym = ElfSymbolCache;
+    static auto runtime_inst =
+        reinterpret_cast<void **>(Sym::GetArt()->getSymbAddress("_ZN3art7Runtime9instance_E"));
+    static auto get_jit = reinterpret_cast<void *(*)(void *)>(
+        Sym::GetArt()->getSymbAddress("_ZNK3art7Runtime6GetJitEv"));
+    static auto enqueue = reinterpret_cast<void (*)(void *, void *, void *)>(
+        Sym::GetArt()->getSymbAddress(
+            "_ZN3art3jit3Jit27EnqueueOptimizedCompilationEPNS_9ArtMethodEPNS_6ThreadE"));
+    if (!runtime_inst || !get_jit || !enqueue || !*runtime_inst) {
+        LOGW("[forcecompile] symbols missing (rt={} getjit={} enq={})", (void *)runtime_inst,
+             (void *)get_jit, (void *)enqueue);
+        return;
+    }
+    void *jit = get_jit(*runtime_inst);
+    if (!jit) {
+        LOGW("[forcecompile] no JIT instance (jit disabled?)");
+        return;
+    }
+    enqueue(jit, method, thread);
+    for (int i = 0; i < 200; i++) {  // ~1s
+        usleep(5000);
+        void *e = *reinterpret_cast<void **>(reinterpret_cast<char *>(method) + 24);
+        if (e != qc && QcIsTraceable(e)) {
+            LOGI("[forcecompile] method {} compiled: qc {} -> {}", method, qc, e);
+            return;
+        }
+    }
+    LOGW("[forcecompile] method {} compile timeout (stays nterp -> in-place)", method);
 }
 
 // ---- Detection probe (the GOAL judge, gated by persist.kpmhook.probe=1) -----------------
@@ -375,6 +417,20 @@ private:
                 LOGI("[l2] traceless Java hook: qc={} -> trampoline {}, clone-backup={} ({})", target,
                      replace, bk, bk ? "TRACELESS" : "in-place fallback");
                 return bk;
+            },
+        // M-C (EXPERIMENTAL, default OFF via persist.kpmhook.fc): force-compile a non-AOT target
+        // so the traceless path has a unique body to trap. KNOWN ISSUE: a synchronous compile-wait
+        // in DoHook hangs app init (postAppSpecialize runs before the JIT thread is up, so the
+        // compile never completes and the wait blocks until AMS kills the app). Needs a deferred
+        // post-init upgrade design -- gated off until then so it never breaks a real app.
+        .force_compile =
+            [](void *method, void *thread) {
+                char v[PROP_VALUE_MAX] = {0};
+                if (!kUseKpmBackend ||
+                    __system_property_get("persist.kpmhook.fc", v) <= 0 || v[0] != '1')
+                    return;
+                if (kpm_hook_init() != 0) return;  // gated process + bridge armed only
+                ForceCompileMethod(method, thread);
             },
         .generated_class_name = "Vector_",
         .generated_source_name = "Dobby",
