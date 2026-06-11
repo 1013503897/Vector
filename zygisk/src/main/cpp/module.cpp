@@ -12,6 +12,7 @@
 #include <cstring>
 #include <chrono>
 #include <thread>
+#include <fcntl.h>
 
 #include <zygisk.hpp>
 
@@ -123,10 +124,42 @@ static void DetectionProbeScan() {
             if (sscanf(line, "TracerPid:\t%d", &tracer_pid) == 1) break;
         fclose(f);
     }
-    LOGI("[probe] ===== DETECTION PROBE ===== S2 anon-rx={} rwxp={}  S5 TracerPid={}", anon_rx, rwx,
-         tracer_pid);
-    LOGI("[probe] VERDICT S2(maps/smaps)={} S5(ptrace)={}", (anon_rx == 0 && rwx == 0) ? "CLEAN" : "DETECTED",
-         tracer_pid == 0 ? "CLEAN" : "DETECTED");
+    // ---- surface #1/#4: code integrity — compare libart.so's in-memory .text (r-xp) vs the
+    // on-disk file. ANY byte diff is an inline patch (Dobby/hook); the KPM never writes .text
+    // (it UXN-traps + clones), so a traceless install leaves 0 diffs. (-1 = couldn't check.) ----
+    long code_diffs = -1;
+    f = fopen("/proc/self/maps", "re");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            uintptr_t lo = 0, hi = 0;
+            unsigned long foff = 0;
+            char perms[8] = {0}, path[256] = {0};
+            if (sscanf(line, "%lx-%lx %7s %lx %*x:%*x %*u %255[^\n]", &lo, &hi, perms, &foff,
+                       path) >= 5 &&
+                perms[2] == 'x' && strstr(path, "libart.so")) {
+                int fd = open(path, O_RDONLY | O_CLOEXEC);
+                if (fd < 0) break;
+                code_diffs = 0;
+                unsigned char buf[4096];
+                for (uintptr_t pg = lo; pg < hi; pg += 4096) {
+                    off_t off = (off_t)foff + (off_t)(pg - lo);
+                    if (pread(fd, buf, 4096, off) == 4096 &&
+                        memcmp(buf, reinterpret_cast<void *>(pg), 4096) != 0)
+                        code_diffs++;  // a patched page
+                }
+                close(fd);
+                break;
+            }
+        }
+        fclose(f);
+    }
+    LOGI("[probe] ===== DETECTION PROBE ===== S2 anon-rx={} rwxp={}  S5 TracerPid={}  S1/4 "
+         "libart-patched-pages={}",
+         anon_rx, rwx, tracer_pid, code_diffs);
+    LOGI("[probe] VERDICT S2(maps/smaps)={} S5(ptrace)={} S1/4(code-CRC)={}",
+         (anon_rx == 0 && rwx == 0) ? "CLEAN" : "DETECTED", tracer_pid == 0 ? "CLEAN" : "DETECTED",
+         code_diffs == 0 ? "CLEAN" : (code_diffs < 0 ? "SKIP" : "DETECTED"));
 }
 static void RunDetectionProbe() {
     char v[PROP_VALUE_MAX] = {0};
