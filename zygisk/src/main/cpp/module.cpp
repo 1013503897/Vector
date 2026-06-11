@@ -8,6 +8,9 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <cstdio>
+#include <cstring>
+
 #include <zygisk.hpp>
 
 #include "ipc_bridge.h"
@@ -37,6 +40,42 @@ constexpr uid_t kHostPackageUid = INJECTED_PACKAGE_UID;
 const char *const kHostPackageName = VEC_STR(INJECTED_PACKAGE_NAME);
 const char *const kManagerPackageName = VEC_STR(MANAGER_PACKAGE_NAME);
 constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
+
+// May we KPM-trap `qc` (a Java method's quick-compiled entry) for L2? Two conditions:
+//  (1) qc is in a file-backed AOT region (boot.oat / app .odex). Excludes JIT (shared anon
+//      cache) and the libart interpreter bridge.
+//  (2) qc is a genuine per-method compiled body, NOT a SHARED boot.oat stub. Many framework
+//      methods aren't individually AOT-compiled and share an nterp/bridge stub that lives in
+//      boot.oat (so (1) alone passes!) -- trapping a shared stub reroutes EVERY method using
+//      it. A real dex2oat method has an OatQuickMethodHeader right before its code whose
+//      code_size is small/sane; a shared stub's qc-4 is an instruction word (huge when masked),
+//      so the code_size sanity check rejects it. Non-traceable methods fall back to in-place.
+static bool QcIsTraceable(const void *qc) {
+    auto a = reinterpret_cast<uintptr_t>(qc);
+    if (a < 0x2000) return false;
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return false;
+    char line[512];
+    bool aot = false;
+    while (fgets(line, sizeof line, f)) {
+        uintptr_t lo = 0, hi = 0;
+        char perms[8] = {0}, path[256] = {0};
+        if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path) >= 3 &&
+            a >= lo && a < hi) {
+            aot = perms[2] == 'x' &&
+                  (strstr(path, ".oat") || strstr(path, ".odex") || strstr(path, ".art") ||
+                   strstr(path, "/oat/"));
+            break;
+        }
+    }
+    fclose(f);
+    if (!aot) return false;
+    // OatQuickMethodHeader.code_size_ sits at qc-4 (top bit = is_code_info flag). A real method
+    // body is a few bytes to a few hundred KiB; a shared stub's qc-4 is an arm64 instruction
+    // word (e.g. RET=0xD65F03C0 -> ~0x165F03C0 masked), far above any real method.
+    uint32_t code_size = *reinterpret_cast<const uint32_t *>(a - 4) & 0x3FFFFFFFu;
+    return code_size >= 8 && code_size <= 0x80000;
+}
 
 // ---- L2a DBI-on-oat self-test (gated by persist.kpmhook.l2test=1) ----------------------
 // The manager process hooks no Java methods, so to validate the traceless L2 mechanism on a
@@ -201,7 +240,15 @@ private:
                 if (!kUseKpmBackend ||
                     __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1')
                     return nullptr;
-                return kpm_inline_hooker(target, replace);
+                if (!QcIsTraceable(target)) {
+                    LOGI("[l2] qc={} not a traceable AOT body (interp/jit/shared stub) -> in-place",
+                         target);
+                    return nullptr;
+                }
+                void *bk = kpm_inline_hooker(target, replace);
+                LOGI("[l2] traceless Java hook: qc={} -> trampoline {}, clone-backup={} ({})", target,
+                     replace, bk, bk ? "TRACELESS" : "in-place fallback");
+                return bk;
             },
         .generated_class_name = "Vector_",
         .generated_source_name = "Dobby",
