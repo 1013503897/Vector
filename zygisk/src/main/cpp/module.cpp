@@ -10,6 +10,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <chrono>
+#include <thread>
 
 #include <zygisk.hpp>
 
@@ -75,6 +77,64 @@ static bool QcIsTraceable(const void *qc) {
     // word (e.g. RET=0xD65F03C0 -> ~0x165F03C0 masked), far above any real method.
     uint32_t code_size = *reinterpret_cast<const uint32_t *>(a - 4) & 0x3FFFFFFFu;
     return code_size >= 8 && code_size <= 0x80000;
+}
+
+// ---- Detection probe (the GOAL judge, gated by persist.kpmhook.probe=1) -----------------
+// Runs INSIDE the gated target app on a delayed thread (to catch hooks installed during
+// startup) and scans the hook-detection surfaces an in-process anti-tamper would check,
+// reporting a count per surface. ZERO across all surfaces (with hooks active) == goal met.
+// Surfaces implemented here: #2 (anomalous executable memory) + #5 (ptrace/TracerPid).
+// #1 (libart/oat CRC), #3 (ArtMethod entry/flags), #4 (inline-hook bytes) need the hooked
+// function/method list and are added as the traceless coverage grows.
+static void DetectionProbeScan() {
+    // ---- surface #2: anomalous executable regions in /proc/self/maps ----
+    // A hook clone is an UNLABELED anon r-xp region; an in-place trampoline (Dobby/LSPlant)
+    // is an rwxp region. Legit exec memory is file-backed, [vdso], or a LABELED [anon:...]
+    // (e.g. dalvik-jit-code-cache). Count the anomalies an anti-tamper scan would flag.
+    int anon_rx = 0, rwx = 0;
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof line, f)) {
+            uintptr_t lo = 0, hi = 0;
+            char perms[8] = {0}, path[256] = {0};
+            int n = sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path);
+            if (n < 3 || perms[2] != 'x') continue;        // executable only
+            bool rwxp = perms[0] == 'r' && perms[1] == 'w';
+            bool labeled = n >= 4 && path[0];
+            bool benign_label = labeled && (strstr(path, "[vdso]") || strstr(path, "jit-cache") ||
+                                            strstr(path, "dalvik-jit-code-cache"));
+            if (rwxp && !benign_label) {
+                rwx++;
+                LOGW("[probe] S2 rwxp exec region: {}", line);
+            } else if (!labeled) {  // unlabeled anon r-xp == hook-clone signature
+                anon_rx++;
+                LOGW("[probe] S2 unlabeled anon r-xp region: {}", line);
+            }
+        }
+        fclose(f);
+    }
+    // ---- surface #5: ptrace / TracerPid ----
+    int tracer_pid = -1;
+    f = fopen("/proc/self/status", "re");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f))
+            if (sscanf(line, "TracerPid:\t%d", &tracer_pid) == 1) break;
+        fclose(f);
+    }
+    LOGI("[probe] ===== DETECTION PROBE ===== S2 anon-rx={} rwxp={}  S5 TracerPid={}", anon_rx, rwx,
+         tracer_pid);
+    LOGI("[probe] VERDICT S2(maps/smaps)={} S5(ptrace)={}", (anon_rx == 0 && rwx == 0) ? "CLEAN" : "DETECTED",
+         tracer_pid == 0 ? "CLEAN" : "DETECTED");
+}
+static void RunDetectionProbe() {
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("persist.kpmhook.probe", v) <= 0 || v[0] != '1') return;
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(6));  // let startup hooks install
+        DetectionProbeScan();
+    }).detach();
 }
 
 // ---- L2a DBI-on-oat self-test (gated by persist.kpmhook.l2test=1) ----------------------
@@ -470,6 +530,9 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     this->InitArtHooker(env_, init_info_);
     // L2a DBI-on-oat self-test (no-op unless persist.kpmhook.l2test=1 AND KPM-gated process).
     RunL2SelfTest(env_);
+    // Detection probe (no-op unless persist.kpmhook.probe=1): the GOAL judge, scans this
+    // process's hook-detection surfaces on a delayed thread.
+    RunDetectionProbe();
     // Initialize JNI hooks via the native library.
     this->InitHooks(env_);
     // Find the Java entrypoint.
