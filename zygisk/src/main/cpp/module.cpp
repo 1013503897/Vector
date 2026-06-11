@@ -44,6 +44,19 @@ const char *const kHostPackageName = VEC_STR(INJECTED_PACKAGE_NAME);
 const char *const kManagerPackageName = VEC_STR(MANAGER_PACKAGE_NAME);
 constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
 
+// Hooked-method registry (filled by lsplant's on_method_hooked notifier) -- the detection probe
+// reads it to verify surface #3 (each hooked method's ArtMethod is pristine).
+static constexpr int kMaxHookedMethods = 512;
+static void *g_hooked_methods[kMaxHookedMethods];
+static volatile int g_hooked_count = 0;
+static void RecordHookedMethod(void *method) {
+    int i = g_hooked_count;
+    if (i < kMaxHookedMethods) {
+        g_hooked_methods[i] = method;
+        g_hooked_count = i + 1;
+    }
+}
+
 // May we KPM-trap `qc` (a Java method's quick-compiled entry) for L2? Two conditions:
 //  (1) qc is in a file-backed AOT region (boot.oat / app .odex). Excludes JIT (shared anon
 //      cache) and the libart interpreter bridge.
@@ -196,12 +209,34 @@ static void DetectionProbeScan() {
         }
         fclose(f);
     }
+    // ---- surface #3: ArtMethod integrity. For each hooked method, the entry_point must point at
+    // legit unique compiled code (oat/jit) and access_flags must not carry the hook's
+    // kAccCompileDontBother. An in-place hook leaves entry==trampoline (not traceable) and the flag
+    // set -> DETECTED; a traceless hook leaves entry==real oat/jit code, flag clear -> CLEAN. ----
+    constexpr uint32_t kAccCompileDontBother = 0x02000000u;
+    int hooked = g_hooked_count, s3_bad = 0;
+    for (int i = 0; i < hooked && i < kMaxHookedMethods; i++) {
+        void *m = g_hooked_methods[i];
+        if (!m) continue;
+        void *entry = *reinterpret_cast<void **>(reinterpret_cast<char *>(m) + 24);
+        uint32_t flags = *reinterpret_cast<uint32_t *>(reinterpret_cast<char *>(m) + 4);
+        bool entry_ok = QcIsTraceable(entry);            // points at legit unique oat/jit body
+        bool flags_ok = !(flags & kAccCompileDontBother);  // not marked non-compilable by a hook
+        if (!entry_ok || !flags_ok) {
+            s3_bad++;
+            if (s3_bad <= 6)
+                LOGW("[probe] S3 mutated ArtMethod {}: entry={} ({}) flags={:#x} ({})", m, entry,
+                     entry_ok ? "legit" : "ANOMALOUS", flags, flags_ok ? "ok" : "DontBother-set");
+        }
+    }
+
     LOGI("[probe] ===== DETECTION PROBE ===== S2 anon-rx={} rwxp={}  S5 TracerPid={}  S1/4 "
-         "libart-patched-pages={}",
-         anon_rx, rwx, tracer_pid, code_diffs);
-    LOGI("[probe] VERDICT S2(maps/smaps)={} S5(ptrace)={} S1/4(code-CRC)={}",
+         "libart-patched-pages={}  S3 hooked={} mutated={}",
+         anon_rx, rwx, tracer_pid, code_diffs, hooked, s3_bad);
+    LOGI("[probe] VERDICT S2(maps/smaps)={} S5(ptrace)={} S1/4(code-CRC)={} S3(ArtMethod)={}",
          (anon_rx == 0 && rwx == 0) ? "CLEAN" : "DETECTED", tracer_pid == 0 ? "CLEAN" : "DETECTED",
-         code_diffs == 0 ? "CLEAN" : (code_diffs < 0 ? "SKIP" : "DETECTED"));
+         code_diffs == 0 ? "CLEAN" : (code_diffs < 0 ? "SKIP" : "DETECTED"),
+         (hooked > 0 && s3_bad == 0) ? "CLEAN" : (hooked == 0 ? "no-hooks" : "DETECTED"));
 }
 static void RunDetectionProbe() {
     char v[PROP_VALUE_MAX] = {0};
@@ -432,6 +467,9 @@ private:
                 if (kpm_hook_init() != 0) return;  // gated process + bridge armed only
                 ForceCompileMethod(method, thread);
             },
+        // Detection-probe surface #3: record every hooked method so the probe can verify each
+        // one's ArtMethod is pristine (entry in legit oat/jit, no kAccCompileDontBother).
+        .on_method_hooked = [](void *method) { RecordHookedMethod(method); },
         .generated_class_name = "Vector_",
         .generated_source_name = "Dobby",
     };
