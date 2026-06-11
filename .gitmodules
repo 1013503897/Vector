@@ -1,6 +1,6 @@
 [submodule "external/lsplant"]
 	path = external/lsplant
-	url = https://github.com/JingMatrix/LSPlant.git
+	url = https://github.com/1013503897/LSPlant.git
 [submodule "external/dobby"]
 	path = external/dobby
 	url = https://github.com/JingMatrix/Dobby.git
