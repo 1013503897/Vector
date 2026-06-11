@@ -38,6 +38,70 @@ const char *const kHostPackageName = VEC_STR(INJECTED_PACKAGE_NAME);
 const char *const kManagerPackageName = VEC_STR(MANAGER_PACKAGE_NAME);
 constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
 
+// ---- L2a DBI-on-oat self-test (gated by persist.kpmhook.l2test=1) ----------------------
+// The manager process hooks no Java methods, so to validate the traceless L2 mechanism on a
+// real AOT framework method we deliberately trap java.lang.Math.max's compiled oat code via
+// the KPM and check: (1) the DBI recompiled the real oat region (kpm_inline_hooker != null),
+// (2) trap+redirect fires (max -> stub sentinel), (3) the in-clone copy of max executes
+// faithfully (invoked via min's entry -> returns max's result), (4) max's ArtMethod stays
+// byte-pristine. Then unhook so the manager's Math.max is left intact. ArtMethod entry_point
+// is at +24 on this device (logged by LSPlant at init).
+extern "C" __attribute__((used)) int l2_selftest_stub(int, int) { return 0x7777; }
+static inline void *AmEntry(jmethodID m) {
+    return *reinterpret_cast<void **>(reinterpret_cast<char *>(m) + 24);
+}
+static inline void AmSetEntry(jmethodID m, void *e) {
+    *reinterpret_cast<void **>(reinterpret_cast<char *>(m) + 24) = e;
+}
+static void RunL2SelfTest(JNIEnv *env) {
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("persist.kpmhook.l2test", v) <= 0 || v[0] != '1') return;
+    if (!kUseKpmBackend || kpm_hook_init() != 0) {
+        LOGW("[l2test] KPM not gated/armed in this process; skip");
+        return;
+    }
+    jclass mathC = env->FindClass("java/lang/Math");
+    if (!mathC) { env->ExceptionClear(); LOGW("[l2test] no java.lang.Math"); return; }
+    jmethodID maxId = env->GetStaticMethodID(mathC, "max", "(II)I");
+    jmethodID minId = env->GetStaticMethodID(mathC, "min", "(II)I");
+    if (!maxId || !minId) { env->ExceptionClear(); LOGW("[l2test] no max/min id"); return; }
+
+    void *maxQc = AmEntry(maxId), *minQc = AmEntry(minId);
+    jint base_max = env->CallStaticIntMethod(mathC, maxId, 5, 9);
+    jint base_min = env->CallStaticIntMethod(mathC, minId, 5, 9);
+    LOGI("[l2test] maxQc={} minQc={} baseline max(5,9)={} min(5,9)={}", maxQc, minQc, base_max,
+         base_min);
+
+    void *backup = kpm_inline_hooker(maxQc, reinterpret_cast<void *>(&l2_selftest_stub));
+    if (!backup) {
+        LOGE("[l2test] FAIL: kpm_inline_hooker NULL (DBI bailed or no clean region within 64p)");
+        return;
+    }
+    LOGI("[l2test] PASS DBI-on-oat recompile: Math.max region cloned, in-clone backup={}", backup);
+
+    jint hooked_max = env->CallStaticIntMethod(mathC, maxId, 5, 9);  // expect stub 0x7777
+    void *maxQcAfter = AmEntry(maxId);                                // expect == maxQc (pristine)
+
+    // clone executes faithfully: run the in-clone copy of max via min's entry -> expect max(5,9)
+    void *minOrig = AmEntry(minId);
+    AmSetEntry(minId, backup);
+    jint clone_max = env->CallStaticIntMethod(mathC, minId, 5, 9);  // expect 9 (=max via clone)
+    AmSetEntry(minId, minOrig);
+
+    kpm_inline_unhooker(maxQc);                                      // leave manager's Math.max intact
+    jint post_max = env->CallStaticIntMethod(mathC, maxId, 5, 9);   // expect 9 again
+
+    LOGI("[l2test] ===== L2a DBI-on-oat VALIDATION =====");
+    LOGI("[l2test] trap+redirect:   max(5,9)={} expect 0x7777({}) -> {}", hooked_max, 0x7777,
+         hooked_max == 0x7777 ? "PASS" : "FAIL");
+    LOGI("[l2test] clone executes:  clone(5,9)={} expect 9        -> {}", clone_max,
+         clone_max == 9 ? "PASS" : "FAIL");
+    LOGI("[l2test] ArtMethod pristine: {} -> {}                   -> {}", maxQc, maxQcAfter,
+         maxQc == maxQcAfter ? "PASS" : "FAIL");
+    LOGI("[l2test] post-unhook:     max(5,9)={} expect 9          -> {}", post_max,
+         post_max == 9 ? "PASS" : "FAIL");
+}
+
 enum RuntimeFlags : uint32_t {
     // Flags defined by NeoZygisk
     LATE_INJECT = 1 << 30,
@@ -126,6 +190,19 @@ private:
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbAddress(symbol); },
         .art_symbol_prefix_resolver =
             [](auto symbol) { return ElfSymbolCache::GetArt()->getSymbPrefixFirstAddress(symbol); },
+        // L2a traceless Java-method hooking (KPM-only, NO Dobby fallback). Ships OFF: engages
+        // only when persist.kpmhook.l2=1 AND in a KPM-gated process (kpm_inline_hooker self-gates
+        // via proc_is_target and returns null elsewhere). On null, DoHook falls back to its normal
+        // in-place entry swap -- it NEVER routes a Java-method hook through Dobby, which would
+        // inline-patch the shared CoW oat page (CRC-detectable AND corrupting).
+        .traceless_inline_hooker =
+            [](auto target, auto replace) -> void * {
+                char v[PROP_VALUE_MAX] = {0};
+                if (!kUseKpmBackend ||
+                    __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1')
+                    return nullptr;
+                return kpm_inline_hooker(target, replace);
+            },
         .generated_class_name = "Vector_",
         .generated_source_name = "Dobby",
     };
@@ -344,6 +421,8 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
 
     // Initialize ART hooks via the native library.
     this->InitArtHooker(env_, init_info_);
+    // L2a DBI-on-oat self-test (no-op unless persist.kpmhook.l2test=1 AND KPM-gated process).
+    RunL2SelfTest(env_);
     // Initialize JNI hooks via the native library.
     this->InitHooks(env_);
     // Find the Java entrypoint.
