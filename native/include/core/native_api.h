@@ -106,6 +106,9 @@ void kpm_hook_set_process_name(const char *name);
 int kpm_hook_init(void);
 void *kpm_inline_hooker(void *target, void *hooker);
 int kpm_inline_unhooker(void *func);
+// Hide an anomalous region (page of `addr`) from this process's /proc/self/{maps,smaps} via
+// the KPM's mm-gated maps-hide -- e.g. the LSPlant trampoline pool (rwxp anon). Gated process only.
+int kpm_hide_region(void *addr);
 }
 
 namespace vector::native {

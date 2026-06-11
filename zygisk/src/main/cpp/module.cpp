@@ -137,6 +137,39 @@ static void RunDetectionProbe() {
     }).detach();
 }
 
+// Hide this process's anomalous rwxp anon regions (the LSPlant trampoline pool that every hook
+// creates) from /proc/self/{maps,smaps} via the KPM. rwxp anon memory is the classic hook/
+// trampoline signature — on a W^X system nothing legit is rwxp — so hiding all of them closes the
+// trampoline leak in surface #2. mm-gated in the KPM; only acts in the gated process.
+static void HideRwxpRegionsScan() {
+    if (kpm_hook_init() != 0) return;  // gated process + bridge armed only
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return;
+    char line[512];
+    int hid = 0;
+    while (fgets(line, sizeof line, f)) {
+        uintptr_t lo = 0, hi = 0;
+        char perms[8] = {0}, path[256] = {0};
+        int n = sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path);
+        if (n < 3) continue;
+        bool rwxp = perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x';
+        bool anon = !(n >= 4 && path[0]);
+        if (rwxp && anon)
+            for (uintptr_t pg = lo; pg < hi; pg += 0x1000)
+                if (kpm_hide_region(reinterpret_cast<void *>(pg))) hid++;
+    }
+    fclose(f);
+    LOGI("[hidetramp] hid {} rwxp anon trampoline pages from maps/smaps", hid);
+}
+static void RunTrampolineHide() {
+    char v[PROP_VALUE_MAX] = {0};
+    if (!kUseKpmBackend || __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1') return;
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(5));  // after startup hooks install
+        HideRwxpRegionsScan();
+    }).detach();
+}
+
 // ---- L2a DBI-on-oat self-test (gated by persist.kpmhook.l2test=1) ----------------------
 // The manager process hooks no Java methods, so to validate the traceless L2 mechanism on a
 // real AOT framework method we deliberately trap java.lang.Math.max's compiled oat code via
@@ -530,6 +563,9 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     this->InitArtHooker(env_, init_info_);
     // L2a DBI-on-oat self-test (no-op unless persist.kpmhook.l2test=1 AND KPM-gated process).
     RunL2SelfTest(env_);
+    // Hide the LSPlant trampoline pool (rwxp anon) from this process's maps/smaps (no-op unless
+    // persist.kpmhook.l2=1 AND gated). Closes surface #2's trampoline leak.
+    RunTrampolineHide();
     // Detection probe (no-op unless persist.kpmhook.probe=1): the GOAL judge, scans this
     // process's hook-detection surfaces on a delayed thread.
     RunDetectionProbe();
