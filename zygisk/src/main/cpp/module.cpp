@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <fcntl.h>
@@ -50,6 +51,11 @@ static constexpr int kMaxHookedMethods = 512;
 static void *g_hooked_methods[kMaxHookedMethods];
 static volatile int g_hooked_count = 0;
 static JavaVM *g_vm = nullptr;
+// Traceless-convert worker lifecycle, so the detection probe scans AFTER the conversion finishes
+// instead of using a brittle fixed delay. NONE=not launched (fc off / not gated), RUNNING=in flight,
+// DONE=finished (success or bail).
+enum { CONVERT_NONE = 0, CONVERT_RUNNING = 1, CONVERT_DONE = 2 };
+static std::atomic<int> g_convert_state{CONVERT_NONE};
 static void RecordHookedMethod(void *method) {
     int i = g_hooked_count;
     if (i < kMaxHookedMethods) {
@@ -249,7 +255,12 @@ static void RunDetectionProbe() {
     char v[PROP_VALUE_MAX] = {0};
     if (__system_property_get("persist.kpmhook.probe", v) <= 0 || v[0] != '1') return;
     std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(22));  // after the traceless-convert worker
+        std::this_thread::sleep_for(std::chrono::seconds(6));  // let startup hooks install
+        // If a traceless convert is in flight, scan only AFTER it finishes -- no brittle fixed delay
+        // (which raced the worker). Cap the wait so a stuck convert can never block the probe forever.
+        for (int i = 0; i < 300 && g_convert_state.load() == CONVERT_RUNNING; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::this_thread::sleep_for(std::chrono::seconds(1));  // settle after the convert
         DetectionProbeScan();
     }).detach();
 }
@@ -297,33 +308,35 @@ static void RunTracelessConvert() {
     char v[PROP_VALUE_MAX] = {0};
     if (!kUseKpmBackend || __system_property_get("persist.kpmhook.fc", v) <= 0 || v[0] != '1') return;
     if (kpm_hook_init() != 0 || !g_vm) return;  // gated process + have a JavaVM
+    g_convert_state = CONVERT_RUNNING;           // synchronous: the probe will wait for us to finish
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::seconds(6));  // JIT up + startup hooks installed
         JNIEnv *env = nullptr;
-        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
-            LOGW("[convert] AttachCurrentThread failed");
-            return;
-        }
-        // The conversion needs the live art::jit::Jit instance -- captured (via the CompileMethod
-        // hook) the first time ART JITs ANY method in this process. A real app JITs constantly, so
-        // just POLL until the capture fires (up to ~18s). A trivial app may never JIT; then we bail
-        // gracefully (every method keeps its safe in-place hook).
-        for (int i = 0; i < 180 && !lsplant::HasCapturedJit(); i++)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        LOGI("[convert] capture wait done; captured_jit={}", (int)lsplant::HasCapturedJit());
+        if (g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
+            // The conversion needs the live art::jit::Jit instance -- captured the first time ART
+            // checks/JITs ANY method (via the MaybeEnqueueCompilation/CompileMethod hooks), which
+            // happens during ordinary Java execution even in a quiet process. POLL until it fires
+            // (up to ~18s) then bail gracefully if it never does (methods keep their in-place hook).
+            for (int i = 0; i < 180 && !lsplant::HasCapturedJit(); i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            LOGI("[convert] capture wait done; captured_jit={}", (int)lsplant::HasCapturedJit());
 
-        int n = g_hooked_count, ok = 0;
-        for (int i = 0; i < n && i < kMaxHookedMethods; i++) {
-            void *m = g_hooked_methods[i];
-            if (m && lsplant::ConvertToTraceless(m)) ok++;
+            int n = g_hooked_count, ok = 0;
+            for (int i = 0; i < n && i < kMaxHookedMethods; i++) {
+                void *m = g_hooked_methods[i];
+                if (m && lsplant::ConvertToTraceless(m)) ok++;
+            }
+            LOGI("[convert] traceless-converted {}/{} in-place hooks", ok, n);
+            // Belt-and-suspenders: the conversion just minted KPM clones (r-xp anon). They're
+            // auto-hidden by the KPM, but a VMA merge can move a clone's start so the auto-hide's
+            // start-match misses it. Re-scan the post-convert maps and hide every anon-exec VMA by
+            // its (post-merge) start page -> surface #2 stays clean deterministically.
+            HideRwxpRegionsScan();
+            g_vm->DetachCurrentThread();
+        } else {
+            LOGW("[convert] AttachCurrentThread failed");
         }
-        LOGI("[convert] traceless-converted {}/{} in-place hooks", ok, n);
-        // Belt-and-suspenders: the conversion just minted KPM clones (r-xp anon). They're
-        // auto-hidden by the KPM, but a VMA merge can move a clone's start so the auto-hide's
-        // start-match misses it. Re-scan the post-convert maps and hide every anon-exec VMA by its
-        // (post-merge) start page -> surface #2 stays clean deterministically.
-        HideRwxpRegionsScan();
-        g_vm->DetachCurrentThread();
+        g_convert_state = CONVERT_DONE;  // signal the probe regardless of outcome
     }).detach();
 }
 
