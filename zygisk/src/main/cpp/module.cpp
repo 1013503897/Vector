@@ -45,10 +45,11 @@ const char *const kManagerPackageName = VEC_STR(MANAGER_PACKAGE_NAME);
 constexpr uid_t GID_INET = 3003;  // Android's Internet group ID.
 
 // Hooked-method registry (filled by lsplant's on_method_hooked notifier) -- the detection probe
-// reads it to verify surface #3 (each hooked method's ArtMethod is pristine).
+// reads it to verify surface #3, and the traceless-convert worker reads it to upgrade them.
 static constexpr int kMaxHookedMethods = 512;
 static void *g_hooked_methods[kMaxHookedMethods];
 static volatile int g_hooked_count = 0;
+static JavaVM *g_vm = nullptr;
 static void RecordHookedMethod(void *method) {
     int i = g_hooked_count;
     if (i < kMaxHookedMethods) {
@@ -72,24 +73,30 @@ static bool QcIsTraceable(const void *qc) {
     FILE *f = fopen("/proc/self/maps", "re");
     if (!f) return false;
     char line[512];
-    bool aot = false;
+    bool in_oat = false, in_jit = false;
     while (fgets(line, sizeof line, f)) {
         uintptr_t lo = 0, hi = 0;
         char perms[8] = {0}, path[256] = {0};
         if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path) >= 3 &&
             a >= lo && a < hi) {
-            aot = perms[2] == 'x' &&
-                  (strstr(path, ".oat") || strstr(path, ".odex") || strstr(path, ".art") ||
-                   strstr(path, "/oat/") || strstr(path, "jit-code-cache") ||
-                   strstr(path, "jit-cache"));  // JIT body (post force-compile) is also a unique trap target
+            if (perms[2] == 'x') {
+                in_oat = strstr(path, ".oat") || strstr(path, ".odex") || strstr(path, ".art") ||
+                         strstr(path, "/oat/");
+                in_jit = strstr(path, "jit-code-cache") || strstr(path, "jit-cache");
+            }
             break;
         }
     }
     fclose(f);
-    if (!aot) return false;
-    // OatQuickMethodHeader.code_size_ sits at qc-4 (top bit = is_code_info flag). A real method
-    // body is a few bytes to a few hundred KiB; a shared stub's qc-4 is an arm64 instruction
-    // word (e.g. RET=0xD65F03C0 -> ~0x165F03C0 masked), far above any real method.
+    if (!in_oat && !in_jit) return false;
+    // The JIT code-cache holds ONLY unique per-method compiled bodies -- shared nterp/bridge stubs
+    // live in libart.so / boot.oat, never here -- so any executable jit-cache address is a safe,
+    // unique trap target. (Also: for JIT code qc-4 is code_info_offset_, NOT code_size_, so the
+    // boot.oat code_size sanity check below would wrongly reject every JIT body.)
+    if (in_jit) return true;
+    // For .oat/.odex/.art, guard against the SHARED nterp stub many framework methods point at:
+    // a real per-method body has a sane OatQuickMethodHeader.code_size_ at qc-4; a shared stub's
+    // qc-4 is an instruction word (huge when masked), far above any real method.
     uint32_t code_size = *reinterpret_cast<const uint32_t *>(a - 4) & 0x3FFFFFFFu;
     return code_size >= 8 && code_size <= 0x80000;
 }
@@ -242,7 +249,7 @@ static void RunDetectionProbe() {
     char v[PROP_VALUE_MAX] = {0};
     if (__system_property_get("persist.kpmhook.probe", v) <= 0 || v[0] != '1') return;
     std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(6));  // let startup hooks install
+        std::this_thread::sleep_for(std::chrono::seconds(22));  // after the traceless-convert worker
         DetectionProbeScan();
     }).detach();
 }
@@ -277,6 +284,39 @@ static void RunTrampolineHide() {
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::seconds(5));  // after startup hooks install
         HideRwxpRegionsScan();
+    }).detach();
+}
+
+// M-C: post-init worker that upgrades the early in-place hooks to traceless (force-compile + KPM
+// trap, leaving each ArtMethod pristine -> closes surface #3). Gated by persist.kpmhook.fc.
+// Runs as an ATTACHED ART thread (the conversion uses ScopedSuspendAll + art::Thread::Current)
+// AFTER the JIT thread is up and startup hooks are installed.
+static void RunTracelessConvert() {
+    char v[PROP_VALUE_MAX] = {0};
+    if (!kUseKpmBackend || __system_property_get("persist.kpmhook.fc", v) <= 0 || v[0] != '1') return;
+    if (kpm_hook_init() != 0 || !g_vm) return;  // gated process + have a JavaVM
+    std::thread([] {
+        std::this_thread::sleep_for(std::chrono::seconds(6));  // JIT up + startup hooks installed
+        JNIEnv *env = nullptr;
+        if (g_vm->AttachCurrentThread(&env, nullptr) != JNI_OK) {
+            LOGW("[convert] AttachCurrentThread failed");
+            return;
+        }
+        // The conversion needs the live art::jit::Jit instance -- captured (via the CompileMethod
+        // hook) the first time ART JITs ANY method in this process. A real app JITs constantly, so
+        // just POLL until the capture fires (up to ~18s). A trivial app may never JIT; then we bail
+        // gracefully (every method keeps its safe in-place hook).
+        for (int i = 0; i < 180 && !lsplant::HasCapturedJit(); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        LOGI("[convert] capture wait done; captured_jit={}", (int)lsplant::HasCapturedJit());
+
+        int n = g_hooked_count, ok = 0;
+        for (int i = 0; i < n && i < kMaxHookedMethods; i++) {
+            void *m = g_hooked_methods[i];
+            if (m && lsplant::ConvertToTraceless(m)) ok++;
+        }
+        LOGI("[convert] traceless-converted {}/{} in-place hooks", ok, n);
+        g_vm->DetachCurrentThread();
     }).detach();
 }
 
@@ -690,6 +730,9 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     this->InitArtHooker(env_, init_info_);
     // L2a DBI-on-oat self-test (no-op unless persist.kpmhook.l2test=1 AND KPM-gated process).
     RunL2SelfTest(env_);
+    if (env_) env_->GetJavaVM(&g_vm);  // for the traceless-convert worker thread (needs ART attach)
+    // M-C: upgrade the early in-place hooks to traceless post-init (no-op unless persist.kpmhook.fc=1).
+    RunTracelessConvert();
     // Hide the LSPlant trampoline pool (rwxp anon) from this process's maps/smaps (no-op unless
     // persist.kpmhook.l2=1 AND gated). Closes surface #2's trampoline leak.
     RunTrampolineHide();
