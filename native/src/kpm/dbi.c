@@ -185,10 +185,16 @@ int dbi_recompile_range(uintptr_t base, const uint32_t *src, int n, uint32_t *ou
         offmap[i] = (uint32_t)acc;
         acc += insn_size(src[i], base + (uint64_t)i * 4, base, fend);
     }
-    if (acc > out_cap) return DBI_ERR_RANGE;
+    if (acc + 4 > out_cap) return DBI_ERR_RANGE; /* +4: tail fall-through guard (emit_far below) */
 
     int o = 0;
     for (int i = 0; i < n; i++)
         o = emit_one(out, o, src[i], base + (uint64_t)i * 4, base, fend, offmap, lit_lo, lit_hi);
+    /* Tail-guard. The region boundary is picked by clean_boundary(), which accepts NOP / zero /
+     * tail-B -- a NOP or zero FALLS THROUGH, and a method can be cut mid-body at such a word. So a
+     * clone execution path can run PAST the last recompiled insn into the zero-padded page round-up
+     * (0x00000000 == UDF -> SIGILL). Redirect any fall-through to the original continuation `fend`
+     * (untrapped, or the next trapped region -> kernel-routed) instead of into the dead zero tail. */
+    o += emit_far(&out[o], fend, 0);
     return o;
 }
