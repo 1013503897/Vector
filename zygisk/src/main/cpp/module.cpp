@@ -254,10 +254,12 @@ static void RunDetectionProbe() {
     }).detach();
 }
 
-// Hide this process's anomalous rwxp anon regions (the LSPlant trampoline pool that every hook
-// creates) from /proc/self/{maps,smaps} via the KPM. rwxp anon memory is the classic hook/
-// trampoline signature — on a W^X system nothing legit is rwxp — so hiding all of them closes the
-// trampoline leak in surface #2. mm-gated in the KPM; only acts in the gated process.
+// Hide this process's anomalous anon EXECUTABLE regions from /proc/self/{maps,smaps} via the KPM.
+// Two signatures: rwxp anon (the LSPlant trampoline pool every hook creates) AND r-xp anon (the KPM
+// region clones, incl. any the auto-hide missed because a VMA merge moved its start). On a W^X
+// system nothing legit is anon+executable, so hiding every such region closes surface #2. We read
+// the POST-MERGE maps, so registering each VMA's start page hides the whole (possibly merged) VMA.
+// mm-gated in the KPM; only acts in the gated process. Safe to call repeatedly (hide-set dedups).
 static void HideRwxpRegionsScan() {
     if (kpm_hook_init() != 0) return;  // gated process + bridge armed only
     FILE *f = fopen("/proc/self/maps", "re");
@@ -269,14 +271,14 @@ static void HideRwxpRegionsScan() {
         char perms[8] = {0}, path[256] = {0};
         int n = sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path);
         if (n < 3) continue;
-        bool rwxp = perms[0] == 'r' && perms[1] == 'w' && perms[2] == 'x';
+        bool exec = perms[2] == 'x';
         bool anon = !(n >= 4 && path[0]);
-        if (rwxp && anon)
+        if (exec && anon)
             for (uintptr_t pg = lo; pg < hi; pg += 0x1000)
                 if (kpm_hide_region(reinterpret_cast<void *>(pg))) hid++;
     }
     fclose(f);
-    LOGI("[hidetramp] hid {} rwxp anon trampoline pages from maps/smaps", hid);
+    LOGI("[hidetramp] hid {} anon-exec pages (trampoline/clone) from maps/smaps", hid);
 }
 static void RunTrampolineHide() {
     char v[PROP_VALUE_MAX] = {0};
@@ -316,6 +318,11 @@ static void RunTracelessConvert() {
             if (m && lsplant::ConvertToTraceless(m)) ok++;
         }
         LOGI("[convert] traceless-converted {}/{} in-place hooks", ok, n);
+        // Belt-and-suspenders: the conversion just minted KPM clones (r-xp anon). They're
+        // auto-hidden by the KPM, but a VMA merge can move a clone's start so the auto-hide's
+        // start-match misses it. Re-scan the post-convert maps and hide every anon-exec VMA by its
+        // (post-merge) start page -> surface #2 stays clean deterministically.
+        HideRwxpRegionsScan();
         g_vm->DetachCurrentThread();
     }).detach();
 }
