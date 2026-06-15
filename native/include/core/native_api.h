@@ -106,6 +106,10 @@ void kpm_hook_set_process_name(const char *name);
 int kpm_hook_init(void);
 void *kpm_inline_hooker(void *target, void *hooker);
 int kpm_inline_unhooker(void *func);
+// Traceless Java-method (qc) hook via SSOL -- distinct from kpm_inline_hooker (which clones hot
+// libart-FUNCTION pages). Used by LSPlant's traceless_inline_hooker; returns the unmapped backup VA.
+void *kpm_ssol_hooker(void *target, void *hooker);
+int kpm_ssol_unhooker(void *func);
 // Hide an anomalous region (page of `addr`) from this process's /proc/self/{maps,smaps} via
 // the KPM's mm-gated maps-hide -- e.g. the LSPlant trampoline pool (rwxp anon). Gated process only.
 int kpm_hide_region(void *addr);

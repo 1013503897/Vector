@@ -508,8 +508,8 @@ private:
                          target);
                     return nullptr;
                 }
-                void *bk = kpm_inline_hooker(target, replace);
-                LOGI("[l2] traceless Java hook: qc={} -> trampoline {}, clone-backup={} ({})", target,
+                void *bk = kpm_ssol_hooker(target, replace);
+                LOGI("[l2] traceless Java hook (SSOL): qc={} -> trampoline {}, bk_va={} ({})", target,
                      replace, bk, bk ? "TRACELESS" : "in-place fallback");
                 return bk;
             },

@@ -68,6 +68,16 @@ void *kpm_inline_hooker(void *target, void *hooker);
  * passed to kpm_inline_hooker. Returns 1 on success, 0 on failure. */
 int kpm_inline_unhooker(void *func);
 
+/* LSPlant InitInfo.traceless_inline_hooker (Java methods only): SSOL-trap the cold
+ * quick-compiled body `target` so a call routes to `hooker` and a call-original runs
+ * the original via SSOL. Returns the unmapped backup VA, or NULL -> in-place fallback.
+ * Distinct from kpm_inline_hooker: that clones hot libart-FUNCTION pages; SSOL on hot
+ * .text would be a fault storm. See kpmhook.c for the split rationale. */
+void *kpm_ssol_hooker(void *target, void *hooker);
+
+/* Tear down one SSOL traceless hook installed by kpm_ssol_hooker. Returns 1/0. */
+int kpm_ssol_unhooker(void *func);
+
 #ifdef __cplusplus
 }
 #endif

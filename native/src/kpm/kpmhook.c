@@ -433,6 +433,147 @@ out:
     return ok;
 }
 
+/* ===================== SSOL traceless-hook path (Java methods) =====================
+ * The clone/pghook path above is for HOT libart-FUNCTION inline hooks (HookInline): it
+ * reroutes the whole page to a clone that runs natively at full speed -- right for hot
+ * code, but WRONG for the cold Java-method `qc` traceless hooks (traceless_inline_hooker),
+ * where on dense framework JIT the clone corrupts (code/data interleaving + clone return
+ * addresses -> SIGILL/SIGSEGV). SSOL runs the ORIGINAL qc at its original address (the KPM
+ * UXN-traps the qc page and simulates / single-steps each insn), so it is correct on
+ * complex apps -- at the cost of a fault per executed insn on the trapped page. That is
+ * fine for a COLD qc (only runs via the hook / call-original) but would be catastrophic on
+ * HOT libart .text (a fault storm; observed: SIGTRAP). Hence a SEPARATE table + entry
+ * points from the clone path: kpm_inline_hooker stays clone (libart funcs), this is SSOL.
+ *
+ * Two pools of UNMAPPED high user VAs (must not collide with a real mapping; high VAs are
+ * normally free on this arm64 layout -- the KPM self-test used the same range):
+ *   xol_va = SSOL_XOL_BASE + region_index * PAGE_SZ                  (one scratch page/region)
+ *   bk_va  = SSOL_BK_BASE  + (region_index*SSOL_MAX_OV + slot)*PAGE  (unique backup VA/hook) */
+#define SSOL_MAX_REGIONS 16 /* must not exceed the KPM's MAX_SSOL_RGN (16) */
+#define SSOL_MAX_OV 16      /* hooked qc per region; must not exceed the KPM's MAX_SSOL_OV (16) */
+#define SSOL_BK_BASE 0x5500000000ULL
+#define SSOL_XOL_BASE 0x5540000000ULL
+
+struct sov {
+    int used;
+    uint64_t off;   /* page-relative offset of the hooked qc entry (qc - base) */
+    void *replace;  /* the LSPlant trampoline */
+    uint64_t bk_va; /* unique unmapped backup VA handed back to LSPlant */
+};
+struct srgn {
+    int used;
+    uint64_t base;   /* qc's code page (qc & ~0xfff); the KPM UXN-traps exactly this 1 page */
+    uint64_t xol_va; /* per-region XOL scratch page VA (unmapped) */
+    struct sov ov[SSOL_MAX_OV];
+};
+static struct srgn g_srgns[SSOL_MAX_REGIONS];
+
+/* SSOL region whose trapped page (== base) contains `target` (each region traps one page,
+ * so several qc on that page share it). */
+static struct srgn *find_srgn_locked(uint64_t target)
+{
+    uint64_t page = target & ~(PAGE_SZ - 1);
+    for (int i = 0; i < SSOL_MAX_REGIONS; i++)
+        if (g_srgns[i].used && g_srgns[i].base == page) return &g_srgns[i];
+    return 0;
+}
+static struct srgn *make_srgn_locked(uint64_t target)
+{
+    int idx = -1;
+    for (int i = 0; i < SSOL_MAX_REGIONS; i++)
+        if (!g_srgns[i].used) { idx = i; break; }
+    if (idx < 0) return 0; /* table full -> in-place fallback */
+    struct srgn *e = &g_srgns[idx];
+    memset(e, 0, sizeof(*e));
+    e->base = target & ~(PAGE_SZ - 1);
+    e->xol_va = SSOL_XOL_BASE + (uint64_t)idx * PAGE_SZ;
+    e->used = 1;
+    return e;
+}
+
+/* LSPlant InitInfo.traceless_inline_hooker: SSOL-trap the Java method `qc` (cold) so a real
+ * call routes to `hooker` (the trampoline) and a call-original runs the body via SSOL.
+ * Returns the unmapped backup VA (bk_va, set by LSPlant as the backup-ArtMethod entry), or
+ * NULL -> caller falls back to the in-place ArtMethod swap. NOT for libart-function hooks --
+ * those stay on the clone via kpm_inline_hooker (SSOL on hot .text is a fault storm). */
+void *kpm_ssol_hooker(void *target, void *hooker)
+{
+    uint64_t bk = 0;
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) goto out;
+
+    uintptr_t t = (uintptr_t)target;
+    struct srgn *e = find_srgn_locked(t); /* same-page qc share one trapped region */
+    if (!e) e = make_srgn_locked(t);
+    if (!e) goto out; /* region table full -> in-place fallback */
+    int ri = (int)(e - g_srgns);
+    uint64_t off = t - e->base; /* page-relative entry offset */
+
+    /* find this qc's existing ov slot (re-hook) or claim a free one. bk_va is derived from
+     * (region, slot) so it is unique + stable across re-hooks. */
+    int k = -1, freek = -1;
+    for (int i = 0; i < SSOL_MAX_OV; i++) {
+        if (e->ov[i].used && e->ov[i].off == off) { k = i; break; }
+        if (freek < 0 && !e->ov[i].used) freek = i;
+    }
+    if (k < 0) k = freek;
+    if (k < 0) goto out; /* ov table full -> in-place fallback */
+    uint64_t bkva = SSOL_BK_BASE + ((uint64_t)ri * SSOL_MAX_OV + (uint64_t)k) * PAGE_SZ;
+
+    /* ssolhook <pid> <region_base> <npages=1> <xol_va> <entry=qc> <replace=trampoline> <backup=bk_va> */
+    char cmd[192], out[256];
+    snprintf(cmd, sizeof cmd, "ssolhook %d 0x%lx 1 0x%lx 0x%lx 0x%lx 0x%lx", g_pid,
+             (unsigned long)e->base, (unsigned long)e->xol_va, (unsigned long)t,
+             (unsigned long)(uintptr_t)hooker, (unsigned long)bkva);
+    bridge_cmd(cmd, out, sizeof out);
+    if (!reply_ok(out)) {
+        int any = 0;
+        for (int i = 0; i < SSOL_MAX_OV; i++)
+            if (e->ov[i].used) { any = 1; break; }
+        if (!any) e->used = 0; /* release a freshly-made-but-unused region */
+        goto out;
+    }
+    e->ov[k].used = 1;
+    e->ov[k].off = off;
+    e->ov[k].replace = hooker;
+    e->ov[k].bk_va = bkva;
+    bk = bkva;
+
+out:
+    pthread_mutex_unlock(&g_lock);
+    return (void *)(uintptr_t)bk;
+}
+
+int kpm_ssol_unhooker(void *func)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_lock);
+    if (!g_inited) goto out;
+    uintptr_t f = (uintptr_t)func;
+    struct srgn *e = find_srgn_locked(f);
+    if (!e) goto out;
+    uint64_t off = f - e->base;
+    int k = -1;
+    for (int i = 0; i < SSOL_MAX_OV; i++)
+        if (e->ov[i].used && e->ov[i].off == off) { k = i; break; }
+    if (k < 0) goto out;
+    char cmd[128], out[256];
+    snprintf(cmd, sizeof cmd, "ssolunhook %d 0x%lx 0x%lx", g_pid, (unsigned long)e->base,
+             (unsigned long)f);
+    bridge_cmd(cmd, out, sizeof out);
+    ok = reply_ok(out);
+    if (ok) {
+        e->ov[k].used = 0;
+        int any = 0;
+        for (int i = 0; i < SSOL_MAX_OV; i++)
+            if (e->ov[i].used) { any = 1; break; }
+        if (!any) e->used = 0; /* KPM disarmed the region on the last ov */
+    }
+out:
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
 /* Register an anomalous region (page containing `addr`) with the KPM's mm-gated maps-hide,
  * so an in-process /proc/self/{maps,smaps} scan never sees it -- chiefly the LSPlant trampoline
  * pool (rwxp anon) that every hook creates. Only works in the gated process (bridge armed). */
@@ -458,6 +599,20 @@ void kpm_hook_shutdown(void)
         if (g_rgns[i].clone) munmap(g_rgns[i].clone, g_rgns[i].clone_sz);
         free(g_rgns[i].offmap);
         memset(&g_rgns[i], 0, sizeof(g_rgns[i]));
+    }
+    /* SSOL regions: unhook each live override so the KPM disarms them (do NOT ssoldisarm --
+     * that is global across all processes). */
+    for (int i = 0; i < SSOL_MAX_REGIONS; i++) {
+        struct srgn *e = &g_srgns[i];
+        if (!e->used) continue;
+        for (int j = 0; j < SSOL_MAX_OV; j++) {
+            if (!e->ov[j].used) continue;
+            char cmd[128], out[256];
+            snprintf(cmd, sizeof cmd, "ssolunhook %d 0x%lx 0x%lx", g_pid, (unsigned long)e->base,
+                     (unsigned long)(e->base + e->ov[j].off));
+            bridge_cmd(cmd, out, sizeof out);
+        }
+        memset(e, 0, sizeof(*e));
     }
     pthread_mutex_unlock(&g_lock);
 }
