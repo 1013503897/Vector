@@ -12,6 +12,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -37,6 +38,13 @@ struct Config {
 bool PropIs(const char *name, char want) {
     char v[PROP_VALUE_MAX] = {0};
     return __system_property_get(name, v) > 0 && v[0] == want;
+}
+
+int PropInt(const char *name, int dflt) {
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get(name, v) <= 0 || !v[0]) return dflt;
+    int n = atoi(v);
+    return n > 0 ? n : dflt;
 }
 
 // stealth=0 (Dobby) gate: only run in the process named by persist.kpmhook.target. If the
@@ -91,10 +99,19 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
         LOGI("[unpack] worker: driven={} methods", driven);
     }
 
-    // Let the shell finish loading/decrypting its dex(es), then dump them all from memory.
-    // TODO(P1): a load-done signal is cleaner than a fixed settle (cf. module.cpp convert-done).
-    sleep(15);
-    sink.ScanProcessForDexes();
+    // Packers decrypt lazily / in stages (Yidun, legu, ...) and some anti-root packers exit the
+    // app within a few seconds. So scan IMMEDIATELY and repeatedly with a sub-second interval to
+    // catch the decrypted dex(es) inside that brief window, whenever they materialize
+    // (range-deduped -> already-dumped dexes are skipped cheaply). Props tune the burst.
+    int rounds = PropInt("persist.kpmhook.unpack.rounds", 40);
+    int interval_ms = PropInt("persist.kpmhook.unpack.interval_ms", 400);
+    if (rounds < 1) rounds = 1;
+    if (interval_ms < 1) interval_ms = 1;
+    LOGI("[unpack] scanning {} round(s) every {}ms (immediate start)", rounds, interval_ms);
+    for (int r = 0; r < rounds; r++) {
+        sink.ScanProcessForDexes();                       // scan FIRST -> catch fast-exit packers
+        if (r + 1 < rounds) usleep((useconds_t)interval_ms * 1000);
+    }
     sink.Flush();
 
     if (hooked) RemoveChokeHook();  // P0: one-shot
@@ -113,23 +130,21 @@ Config ReadConfigFromProps() {
 
 }  // namespace
 
-void StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const char *process_name) {
+bool StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const char *process_name) {
     (void)env;
     Config cfg = ReadConfigFromProps();
-    if (!cfg.enabled) return;  // default path: no-op
-    if (!ProcessMatchesTarget(process_name)) return;  // stealth=0 per-app gate
+    if (!cfg.enabled) return false;  // default path: no-op
+    if (!ProcessMatchesTarget(process_name)) return false;  // stealth=0 per-app gate
     if (!vm) {
         LOGW("[unpack] StartIfEnabled: no JavaVM");
-        return;
+        return false;
     }
-    // NOTE: the per-app KPM gate (persist.kpmhook.target) is enforced by kpm_inline_hooker
-    // itself when stealth=1; for stealth=0 the caller (module.cpp) only invokes us for the
-    // gated process, so no extra package check is needed at P0.
     std::string out_dir = (app_data_dir && app_data_dir[0]) ? std::string(app_data_dir) + "/unpack"
                                                             : std::string("/data/local/tmp/unpack");
     LOGI("[unpack] enabled: tier={} stealth={} choke={} dir={} -> spawning worker",
          static_cast<int>(cfg.tier), cfg.stealth, static_cast<int>(cfg.choke), out_dir.c_str());
     std::thread(WorkerMain, vm, cfg, std::move(out_dir)).detach();
+    return true;
 }
 
 }  // namespace vector::native::unpack

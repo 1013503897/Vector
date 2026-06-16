@@ -6,9 +6,12 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <csetjmp>
+#include <csignal>
 #include <cstdio>
 #include <cstring>
 
@@ -78,6 +81,74 @@ const uint8_t *FindDexImage(const uint8_t *inner, size_t *out_size) {
         return cand;
     }
     return nullptr;
+}
+
+// ---- fault-guarded self-read ------------------------------------------------------------
+// /proc/self/mem is EACCES for untrusted_app (SELinux), and a direct read can fault on pages
+// that /proc/self/maps lists readable (guard pages, userfaultfd-GC pages on Android 14+, or a
+// racing unmap in a multithreaded packer like NetEase Yidun). So we read under a SIGSEGV/SIGBUS
+// guard scoped to THIS thread: a fault on our scan thread siglongjmp's back and we skip that
+// page; a fault on any OTHER thread is chained to the app's own handler (we must not disturb the
+// packer's signal handling). No special permissions needed.
+sigjmp_buf g_fault_jmp;
+volatile sig_atomic_t g_fault_active = 0;
+pid_t g_fault_tid = 0;
+struct sigaction g_old_segv, g_old_bus;
+bool g_guard_installed = false;
+
+inline pid_t cur_tid() { return (pid_t)syscall(SYS_gettid); }
+
+void fault_handler(int sig, siginfo_t *info, void *uctx) {
+    if (g_fault_active && cur_tid() == g_fault_tid) siglongjmp(g_fault_jmp, 1);
+    // Not our scan thread (or not scanning) -> chain to the app's previous handler.
+    struct sigaction *old = (sig == SIGBUS) ? &g_old_bus : &g_old_segv;
+    if (old->sa_flags & SA_SIGINFO) {
+        if (old->sa_sigaction) old->sa_sigaction(sig, info, uctx);
+    } else if (old->sa_handler == SIG_DFL || old->sa_handler == SIG_IGN) {
+        signal(sig, SIG_DFL);
+        raise(sig);
+    } else if (old->sa_handler) {
+        old->sa_handler(sig);
+    }
+}
+
+void InstallFaultGuard() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = fault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &g_old_segv);
+    sigaction(SIGBUS, &sa, &g_old_bus);
+    g_fault_tid = cur_tid();
+    g_guard_installed = true;
+}
+
+void RemoveFaultGuard() {
+    if (!g_guard_installed) return;
+    sigaction(SIGSEGV, &g_old_segv, nullptr);
+    sigaction(SIGBUS, &g_old_bus, nullptr);
+    g_guard_installed = false;
+}
+
+// Copy [base, base+n) into buf, page by page under the guard; faulting pages are zeroed.
+// Returns true if any page copied. Caller must hold the guard (InstallFaultGuard) + be the
+// g_fault_tid thread.
+bool ReadRegionGuarded(const uint8_t *base, size_t n, uint8_t *buf) {
+    const size_t PAGE = 4096;
+    bool any = false;
+    for (size_t off = 0; off < n; off += PAGE) {
+        size_t psz = (n - off < PAGE) ? (n - off) : PAGE;
+        if (sigsetjmp(g_fault_jmp, 1) == 0) {
+            g_fault_active = 1;
+            memcpy(buf + off, base + off, psz);
+            any = true;
+        } else {
+            memset(buf + off, 0, psz);  // faulted -> zero this page and continue
+        }
+        g_fault_active = 0;
+    }
+    return any;
 }
 
 }  // namespace
@@ -150,13 +221,15 @@ void CodeItemSink::ScanProcessForDexes() {
     if (!inited_) return;
     FILE *f = fopen("/proc/self/maps", "re");
     if (!f) return;
+    InstallFaultGuard();
     char line[512];
-    size_t found = 0;
+    size_t found = 0, scanned = 0;
+    std::vector<uint8_t> buf;
     while (fgets(line, sizeof(line), f)) {
         uintptr_t start = 0, end = 0;
         char perms[5] = {0};
         if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
-        if (perms[0] != 'r') continue;   // must be readable to scan
+        if (perms[0] != 'r') continue;   // must be readable
         if (perms[2] == 'x') continue;   // dex DATA lives in r--p/rw-p, not code pages
         // Pathname filter: skip framework images; allow anon (decrypted dex) and /data.
         const char *path = strchr(line, '/');
@@ -166,19 +239,25 @@ void CodeItemSink::ScanProcessForDexes() {
                 continue;
         }
         size_t rsize = end - start;
-        if (rsize < sizeof(dex::Header) || rsize > (512u << 20)) continue;
-        const uint8_t *base = reinterpret_cast<const uint8_t *>(start);
+        if (rsize < sizeof(dex::Header) || rsize > (96u << 20)) continue;  // cap the per-region copy
+        const uint8_t *live = reinterpret_cast<const uint8_t *>(start);
+        // Copy the region into a private buffer under the SIGSEGV/SIGBUS guard (never faults us).
+        buf.resize(rsize);
+        if (!ReadRegionGuarded(live, rsize, buf.data())) continue;
+        scanned++;
+        const uint8_t *b = buf.data();
         size_t i = 0;
         while (i + sizeof(dex::Header) <= rsize) {
-            const uint8_t *cand = base + i;
+            const uint8_t *cand = b + i;            // candidate in the SAFE buffer copy
             if (cand[0] == 'd' && dex::IsDexHeader(cand)) {
                 uint32_t fsize = dex::DexFileSize(cand);
                 if ((size_t)i + fsize <= rsize) {
+                    const uint8_t *live_at = live + i;  // dedup key = live address
                     std::lock_guard<std::mutex> g(lock_);
-                    if (FindRangeLocked(cand) < 0) {
+                    if (FindRangeLocked(live_at) < 0) {
                         uint32_t id = (uint32_t)dex_count_++;
-                        ranges_.push_back({cand, cand + fsize, id});
-                        DumpDexLocked(cand, fsize);
+                        ranges_.push_back({live_at, live_at + fsize, id});
+                        DumpDexLocked(cand, fsize);   // dump from the buffer copy (safe)
                         found++;
                     }
                     i += fsize;   // jump past this dex (handles multidex in one vdex)
@@ -188,8 +267,9 @@ void CodeItemSink::ScanProcessForDexes() {
             i += 4;
         }
     }
+    RemoveFaultGuard();
     fclose(f);
-    LOGI("[unpack] maps scan: {} new dex image(s) dumped", found);
+    LOGI("[unpack] maps scan: {} region(s) scanned, {} new dex image(s) dumped", scanned, found);
 }
 
 uint32_t CodeItemSink::RegisterDex(const void *begin, size_t size) {

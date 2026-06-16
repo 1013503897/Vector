@@ -722,11 +722,25 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
     LOGD("Attempting injection into '{}'.", nice_name_str.get());
 
+    // Stealth unpacker (no-op unless persist.kpmhook.unpack=1 AND nice_name==target). Runs in
+    // ANY injected-marked process -- it only needs to be in-process (dump dexes), so it is
+    // INDEPENDENT of Vector's hooking scope / the IPC binder below. Must precede the no-binder
+    // early-return. If it spawns a worker (which runs this library's code), keep the module
+    // mapped regardless of scope.
+    bool unpack_started = false;
+    {
+        JavaVM *uvm = nullptr;
+        env_->GetJavaVM(&uvm);
+        lsplant::JUTFString app_dir(env_, args->app_data_dir);
+        unpack_started = vector::native::unpack::StartIfEnabled(uvm, env_, app_dir.get(),
+                                                                nice_name_str.get());
+    }
+
     auto &ipc_bridge = IPCBridge::GetInstance();
     auto binder = ipc_bridge.RequestAppBinder(env_, args->nice_name);
     if (!binder) {
         LOGD("No IPC binder obtained for '{}'. Skipping injection.", nice_name_str.get());
-        SetAllowUnload(true);
+        SetAllowUnload(!unpack_started);  // keep loaded if the unpacker worker is running
         return;
     }
 
@@ -759,12 +773,8 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     if (env_) env_->GetJavaVM(&g_vm);  // for the traceless-convert worker thread (needs ART attach)
     // M-C: upgrade the early in-place hooks to traceless post-init (no-op unless persist.kpmhook.fc=1).
     RunTracelessConvert();
-    // Stealth unpacker (no-op unless persist.kpmhook.unpack=1 AND gated): hook the CodeItem-restore
-    // choke and dump each app dex to <app_data_dir>/unpack. Independent of the convert worker.
-    {
-        lsplant::JUTFString app_dir(env_, args->app_data_dir);
-        vector::native::unpack::StartIfEnabled(g_vm, env_, app_dir.get(), nice_name_str.get());
-    }
+    // (The stealth unpacker is started earlier in postAppSpecialize -- before the IPC-binder
+    // scope check -- so it runs even for apps outside Vector's hooking scope.)
     // Hide the LSPlant trampoline pool (rwxp anon) from this process's maps/smaps (no-op unless
     // persist.kpmhook.l2=1 AND gated). Closes surface #2's trampoline leak.
     RunTrampolineHide();
