@@ -8,6 +8,8 @@
 //                            -> ART reads the CodeItem to compile. Does NOT run app code -> safe.
 //   Tier C (invoke)        : ArtMethod::Invoke with a fabricated frame. FART-style; risky.
 
+#include <cstddef>
+
 namespace vector::native::unpack {
 
 enum class Tier { kPassive, kForceCompile, kInvoke };

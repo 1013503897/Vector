@@ -5,6 +5,7 @@
 #include <elf/elf_image.h>
 #include <elf/symbol_cache.h>
 #include <jni/jni_bridge.h>
+#include <unpack/unpacker.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
@@ -758,6 +759,12 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     if (env_) env_->GetJavaVM(&g_vm);  // for the traceless-convert worker thread (needs ART attach)
     // M-C: upgrade the early in-place hooks to traceless post-init (no-op unless persist.kpmhook.fc=1).
     RunTracelessConvert();
+    // Stealth unpacker (no-op unless persist.kpmhook.unpack=1 AND gated): hook the CodeItem-restore
+    // choke and dump each app dex to <app_data_dir>/unpack. Independent of the convert worker.
+    {
+        lsplant::JUTFString app_dir(env_, args->app_data_dir);
+        vector::native::unpack::StartIfEnabled(g_vm, env_, app_dir.get(), nice_name_str.get());
+    }
     // Hide the LSPlant trampoline pool (rwxp anon) from this process's maps/smaps (no-op unless
     // persist.kpmhook.l2=1 AND gated). Closes surface #2's trampoline leak.
     RunTrampolineHide();

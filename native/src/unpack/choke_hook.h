@@ -6,7 +6,9 @@
 // Choke-point selection is the key DBI decision: a SMALL single libart function keeps the
 // stealth (kpm_inline_hooker) trap in the L1 regime (DBI-on-libart, oat_census-validated),
 // NOT the dense DBI-on-JIT path that currently SIGILLs (kpm-ultimate-goal 2026-06-13).
-//   kArtMethodInvoke  : ArtMethod::Invoke (recommended default; small).
+//   kArtMethodGetCodeItem : ArtMethod::GetCodeItem (P0 default; resolvable via .gnu_debugdata,
+//                           fires on verify/JIT/interpret = the natural CodeItem-restore point).
+//   kArtMethodInvoke  : ArtMethod::Invoke (small; reflection/runtime calls only -> sparse).
 //   kInterpreterBridge: artInterpreterToInterpreterBridge (small/medium).
 //   kExecute          : art::interpreter::Execute (huge/multi-page -> HARDEST DBI; avoid).
 
@@ -14,7 +16,7 @@ namespace vector::native::unpack {
 
 class CodeItemSink;
 
-enum class ChokePoint { kArtMethodInvoke, kInterpreterBridge, kExecute };
+enum class ChokePoint { kArtMethodGetCodeItem, kArtMethodInvoke, kInterpreterBridge, kExecute };
 
 // Install the choke hook.
 //   stealth=true  -> kpm_inline_hooker (traceless; libart .text untouched, clone hidden).

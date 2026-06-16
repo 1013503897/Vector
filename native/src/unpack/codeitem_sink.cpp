@@ -4,33 +4,216 @@
 
 #include "unpack/codeitem_sink.h"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
 #include <common/logging.h>
+
+#include "unpack/dex_layout.h"
 
 namespace vector::native::unpack {
 
+namespace {
+
+// Find the mapped region [out_start, out_end) of /proc/self/maps that contains `addr`.
+// `want_app` = require the mapping to be an app dex (anonymous, or path under /data) and
+// reject /system, /apex, /vendor framework images. Returns false if not found / filtered.
+bool FindMapping(uintptr_t addr, uintptr_t *out_start, uintptr_t *out_end, bool want_app) {
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[5] = {0};
+        // "start-end perms off dev:dev inode pathname"
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+        if (addr < start || addr >= end) continue;
+        // Must be readable to scan.
+        if (perms[0] != 'r') break;
+        if (want_app) {
+            const char *path = strchr(line, '/');
+            if (path) {
+                if (strncmp(path, "/system", 7) == 0 || strncmp(path, "/apex", 5) == 0 ||
+                    strncmp(path, "/vendor", 7) == 0 || strncmp(path, "/product", 8) == 0) {
+                    break;  // framework image — skip
+                }
+            }
+        }
+        *out_start = start;
+        *out_end = end;
+        found = true;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
+// From an inner pointer known to lie inside a dex's data, recover the dex base + size by
+// scanning backward (4-byte aligned) within the containing VMA for a valid dex header whose
+// [base, base+file_size) still contains `inner`. Bounded by the VMA start and a 32 MB cap.
+// Returns the base (and sets *out_size), or nullptr.
+const uint8_t *FindDexImage(const uint8_t *inner, size_t *out_size) {
+    uintptr_t vstart = 0, vend = 0;
+    if (!FindMapping(reinterpret_cast<uintptr_t>(inner), &vstart, &vend, /*want_app=*/true))
+        return nullptr;
+
+    const uintptr_t kCap = 32u << 20;
+    uintptr_t lo = reinterpret_cast<uintptr_t>(inner);
+    if (lo > kCap && lo - kCap > vstart) vstart = lo - kCap;  // cap the backward window
+    uintptr_t p = lo & ~uintptr_t(3);                          // 4-byte align downward
+    for (; p >= vstart; p -= 4) {
+        const uint8_t *cand = reinterpret_cast<const uint8_t *>(p);
+        if (p + sizeof(dex::Header) > vend) continue;
+        if (!dex::IsDexHeader(cand)) continue;
+        uint32_t fsize = dex::DexFileSize(cand);
+        if (p + fsize > vend) continue;                        // image must fit in the VMA
+        if (reinterpret_cast<uintptr_t>(inner) >= p + fsize) continue;  // must contain inner
+        *out_size = fsize;
+        return cand;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 bool CodeItemSink::Init(const char *out_dir) {
-    // TODO(P0): mkdir -p out_dir (app uid), open the index + per-dex blob files.
-    LOGI("[unpack] sink init dir={}", out_dir ? out_dir : "(null)");
-    return out_dir != nullptr;
+    if (!out_dir) return false;
+    // mkdir -p (best-effort; each component).
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", out_dir);
+    for (char *q = tmp + 1; *q; ++q) {
+        if (*q == '/') {
+            *q = 0;
+            mkdir(tmp, 0700);
+            *q = '/';
+        }
+    }
+    mkdir(tmp, 0700);
+    snprintf(dir_, sizeof(dir_), "%s", out_dir);
+    inited_ = true;
+    LOGI("[unpack] sink init dir={}", dir_);
+    return true;
+}
+
+long CodeItemSink::FindRangeLocked(const uint8_t *inner) const {
+    for (const auto &r : ranges_) {
+        if (inner >= r.base && inner < r.end) return (long)r.id;
+    }
+    return -1;
+}
+
+void CodeItemSink::DumpDexLocked(const uint8_t *base, size_t size) {
+    char path[320];
+    snprintf(path, sizeof(path), "%s/dump_%08x_%zu.dex", dir_, dex::DexChecksum(base), size);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        LOGW("[unpack] dump open failed: {} (errno={})", path, errno);
+        return;
+    }
+    size_t off = 0;
+    while (off < size) {
+        ssize_t w = write(fd, base + off, size - off);
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    fsync(fd);
+    close(fd);
+    LOGI("[unpack] dumped dex -> {} ({} bytes)", path, off);
+}
+
+void CodeItemSink::ObserveCodeItem(const void *code_item) {
+    if (!inited_ || !code_item) return;
+    const uint8_t *ci = reinterpret_cast<const uint8_t *>(code_item);
+    {
+        std::lock_guard<std::mutex> g(lock_);
+        if (FindRangeLocked(ci) >= 0) return;  // dex already known/dumped — hot path
+    }
+    // Slow path (once per dex): locate + dump outside? No — recover then take the lock to
+    // commit, re-checking the range to avoid a double dump under concurrency.
+    size_t size = 0;
+    const uint8_t *base = FindDexImage(ci, &size);
+    if (!base) return;  // not an app dex / couldn't locate — fail closed
+    std::lock_guard<std::mutex> g(lock_);
+    if (FindRangeLocked(ci) >= 0) return;  // another thread won the race
+    uint32_t id = (uint32_t)dex_count_++;
+    ranges_.push_back({base, base + size, id});
+    DumpDexLocked(base, size);
+}
+
+void CodeItemSink::ScanProcessForDexes() {
+    if (!inited_) return;
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return;
+    char line[512];
+    size_t found = 0;
+    while (fgets(line, sizeof(line), f)) {
+        uintptr_t start = 0, end = 0;
+        char perms[5] = {0};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+        if (perms[0] != 'r') continue;   // must be readable to scan
+        if (perms[2] == 'x') continue;   // dex DATA lives in r--p/rw-p, not code pages
+        // Pathname filter: skip framework images; allow anon (decrypted dex) and /data.
+        const char *path = strchr(line, '/');
+        if (path) {
+            if (strncmp(path, "/system", 7) == 0 || strncmp(path, "/apex", 5) == 0 ||
+                strncmp(path, "/vendor", 7) == 0 || strncmp(path, "/product", 8) == 0)
+                continue;
+        }
+        size_t rsize = end - start;
+        if (rsize < sizeof(dex::Header) || rsize > (512u << 20)) continue;
+        const uint8_t *base = reinterpret_cast<const uint8_t *>(start);
+        size_t i = 0;
+        while (i + sizeof(dex::Header) <= rsize) {
+            const uint8_t *cand = base + i;
+            if (cand[0] == 'd' && dex::IsDexHeader(cand)) {
+                uint32_t fsize = dex::DexFileSize(cand);
+                if ((size_t)i + fsize <= rsize) {
+                    std::lock_guard<std::mutex> g(lock_);
+                    if (FindRangeLocked(cand) < 0) {
+                        uint32_t id = (uint32_t)dex_count_++;
+                        ranges_.push_back({cand, cand + fsize, id});
+                        DumpDexLocked(cand, fsize);
+                        found++;
+                    }
+                    i += fsize;   // jump past this dex (handles multidex in one vdex)
+                    continue;
+                }
+            }
+            i += 4;
+        }
+    }
+    fclose(f);
+    LOGI("[unpack] maps scan: {} new dex image(s) dumped", found);
 }
 
 uint32_t CodeItemSink::RegisterDex(const void *begin, size_t size) {
-    // TODO(P0): dedup by `begin`; on first sight dump [begin, begin+size) to
-    // <dir>/dex_<id>.dex (the whole, possibly-nop'd image) and return a new id.
-    LOGI("[unpack] register dex begin={} size={}", begin, size);
-    return static_cast<uint32_t>(dex_count_++);
+    std::lock_guard<std::mutex> g(lock_);
+    const uint8_t *b = reinterpret_cast<const uint8_t *>(begin);
+    long existing = FindRangeLocked(b);
+    if (existing >= 0) return (uint32_t)existing;
+    uint32_t id = (uint32_t)dex_count_++;
+    ranges_.push_back({b, b + size, id});
+    if (inited_) DumpDexLocked(b, size);
+    return id;
 }
 
 void CodeItemSink::Capture(const CaptureRecord &rec) {
-    // TODO(P0): dedup by (dex_id, method_idx); append {dex_id, method_idx, off, len} to
-    // the index + copy `len` bytes from rec.code_item into the per-dex blob. off is
-    // computed by the reassembler from the dex base, or recorded here if cheap.
+    // TODO(P0-design): append {dex_id, method_idx, off, len} to an index + copy the
+    // CodeItem bytes into a per-dex blob (dedup by (dex_id, method_idx)). P0-simple does
+    // whole-dex dumps in ObserveCodeItem and does not need per-method capture.
     (void)rec;
+    std::lock_guard<std::mutex> g(lock_);
     ++capture_count_;
 }
 
 void CodeItemSink::Flush() {
-    // TODO(P0): fsync the index + blobs. Pull to host; tools/dexfixer reassembles.
+    std::lock_guard<std::mutex> g(lock_);
     LOGI("[unpack] sink flush: dex={} captures={}", dex_count_, capture_count_);
 }
 

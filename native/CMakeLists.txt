@@ -39,6 +39,11 @@ target_include_directories(${PROJECT_NAME} PRIVATE src ${VECTOR_ROOT}/external/x
 # Apply the standard pedantic warnings and the ignored warnings list.
 target_compile_options(${PROJECT_NAME} PRIVATE -Wpedantic ${IGNORED_WARNINGS})
 
+# Compile the stealth unpacker (native/src/unpack/*). Those TUs are #ifdef-guarded on this
+# macro; without it they are empty. The feature stays dormant at runtime until
+# persist.kpmhook.unpack=1 (same prop-gate discipline as fc/l2/probe).
+target_compile_definitions(${PROJECT_NAME} PRIVATE VECTOR_UNPACK_ENABLED)
+
 # --- Library Linking ---
 # Link against required external and system libraries.
 # PUBLIC libraries are propagated to targets that link against this one.
