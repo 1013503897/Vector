@@ -513,6 +513,11 @@ private:
                      replace, bk, bk ? "TRACELESS" : "in-place fallback");
                 return bk;
             },
+        // Paired traceless un-hooker: disarm the SSOL trap by its qc. LSPlant uses this to follow
+        // JIT-cache moves -- when a GC relocates/evicts a traceless-hooked method, the stale trap on
+        // its old (recycled) page is disarmed here before re-arming at the new entry.
+        .traceless_inline_unhooker =
+            [](auto func) -> bool { return kpm_ssol_unhooker(func) != 0; },
         // M-C (EXPERIMENTAL, default OFF via persist.kpmhook.fc): force-compile a non-AOT target
         // so the traceless path has a unique body to trap. KNOWN ISSUE: a synchronous compile-wait
         // in DoHook hangs app init (postAppSpecialize runs before the JIT thread is up, so the
