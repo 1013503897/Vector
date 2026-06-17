@@ -37,6 +37,18 @@ struct Internal {
     // operator() is called per mirror::Class; see method_enumerator for the shim.
     void (*class_linker_visit_classes)(void *class_linker, void *visitor) = nullptr;
 
+    // ---- direction-1 increment-1: per-class dex discovery (offset-free) ----
+    // mirror::Class::GetClassDef() -> const dex::ClassDef* — a pointer INTO the live dex image
+    // (the class_defs section). Resolvable on this libart even though GetDexFile is inlined; the
+    // containing /proc/self/maps region IS the real dex (dump it header-agnostically). Lets us
+    // recover Yidun's mangled-header in-memory dex that the whole-dex maps scan skips.
+    const void *(*mirror_class_get_class_def)(void *klass) = nullptr;
+    // ClassLinker::FindClass — raw address, hooked transiently by the finder to capture the
+    // ClassLinker* `this` (arg0). Needed because Runtime::GetClassLinker is INLINED (null) and
+    // the Runtime.class_linker_ offset is unknown on this Android-16 build. FindClass fires on
+    // every class load, so the capture is immediate; the finder unhooks right after.
+    void *class_linker_find_class = nullptr;
+
     // ---- active driver: force-compile (Tier-B, reuse of ForceCompileMethod, §3) ----
     void **runtime_instance = nullptr;                          // art::Runtime::instance_
     void *(*runtime_get_jit)(void *runtime) = nullptr;          // Runtime::GetJit (often INLINED -> null; then derive jit_ via offset, see .cpp)
@@ -46,6 +58,20 @@ struct Internal {
     // ArtMethod.entry_point_from_quick_compiled_code_ byte offset within ArtMethod.
     size_t entry_point_off = 24;
 
+    // ---- direction-1 increment-2: per-method enumeration ABI (calibrated at runtime) ----
+    // ArtMethod stride (== sizeof(ArtMethod)); calibrated via two adjacent Throwable ctors
+    // (lsplant trick). declaring_class_ is at +0 (u32 compressed ref) and dex_method_index_ at
+    // +8 on modern ART. mirror::Class.methods_ (a LengthPrefixedArray<ArtMethod>*, stored as a
+    // raw u64) offset + its element-0 byte offset are SELF-CALIBRATED by scanning a sample Class
+    // for a pointer whose first ArtMethod's declaring_class == that Class.
+    size_t art_method_size = 0;            // 0 until CalibrateArtMethodSize succeeds
+    size_t art_method_declaring_class_off = 0;   // ArtMethod.declaring_class_ (u32)
+    size_t art_method_dex_index_off = 8;         // ArtMethod.dex_method_index_ (u32)
+    size_t class_methods_off = 0;          // mirror::Class.methods_ (u64) — 0 until calibrated
+    size_t class_methods_data_off = 0;     // LengthPrefixedArray<ArtMethod> element-0 offset
+
+    bool methods_calibrated() const { return art_method_size && class_methods_off; }
+
     // Read the method's quick-compiled entry (pure read; same as ForceCompileMethod).
     void *entry_point_of(void *art_method) const;
 
@@ -53,9 +79,28 @@ struct Internal {
     bool ok_for_capture() const;   // P0: get_code_item + get_dex_file + dex begin/size
     bool ok_for_enumerate() const; // P1: + visit_classes
     bool ok_for_forcecompile() const; // P1 Tier-B: + runtime_instance + enqueue
+    bool ok_for_dexfind() const;   // Increment-1: visit_classes + get_class_def + find_class
 };
 
 // Lazily resolves once and caches. Thread-safe one-time init (cf. ElfSymbolCache).
 const Internal &Get();
+
+// Mutable accessor for the calibration writers below (same singleton as Get()).
+Internal &GetMutable();
+
+// increment-2 ABI calibration (idempotent; safe to call repeatedly until they succeed):
+//   CalibrateArtMethodSize — needs a JNIEnv on an ART-attached thread; measures sizeof(ArtMethod)
+//     from two adjacent java.lang.Throwable constructors (lsplant's method).
+//   CalibrateClassMethods  — needs ONE sample mirror::Class* that has >=1 declared method; finds
+//     mirror::Class.methods_ + the element-0 offset by the declaring_class==klass invariant. Must
+//     run while the mutator lock is held (the sample class must be stable) — i.e. from the visitor.
+// Both write into GetMutable(); return true once the value is known.
+bool CalibrateArtMethodSize(void *jni_env);
+bool CalibrateClassMethods(void *sample_klass);
+
+// One-shot orchestration: calibrate art_method_size, derive a stable sample Class* (the declaring
+// class of java.lang.String.length, a non-moving boot class), then calibrate the methods_ offset.
+// Call once from the worker (needs a JNIEnv). Returns true iff methods_calibrated() afterwards.
+bool CalibrateForMethodEnum(void *jni_env);
 
 }  // namespace vector::native::unpack::art

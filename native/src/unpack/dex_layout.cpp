@@ -59,6 +59,11 @@ size_t CodeItemLength(const uint8_t *ci) {
     // Fixed 16-byte standard CodeItem header.
     uint16_t tries_size = *reinterpret_cast<const uint16_t *>(ci + 6);
     uint32_t insns_size = *reinterpret_cast<const uint32_t *>(ci + 12);
+    // Sanity caps: a real standard CodeItem never has these magnitudes. They bound the parse so a
+    // NON-standard input (a CompactDex CodeItem, whose +6/+12 fields mean something else, or random
+    // memory) returns 0 fast instead of running away in the handler loop below.
+    if (insns_size > (1u << 20)) return 0;        // > 1M code units
+    if (tries_size > 8192) return 0;
 
     const uint8_t *p = ci + 16;            // start of insns[]
     p += (size_t)insns_size * 2;           // u2 insns[insns_size]
@@ -71,18 +76,18 @@ size_t CodeItemLength(const uint8_t *ci) {
     p += (size_t)tries_size * 8;
 
     // encoded_catch_handler_list: uleb128 size, then `size` encoded_catch_handler entries.
-    const uint8_t *handlers_base = p;
     uint32_t handler_count = ReadUleb128(&p);
+    if (handler_count > 65536) return 0;          // cap (garbage input)
     for (uint32_t i = 0; i < handler_count; i++) {
         int32_t size = ReadSleb128(&p);           // signed: <0 means a catch-all follows
         uint32_t pairs = (size < 0) ? (uint32_t)(-size) : (uint32_t)size;
+        if (pairs > 65536) return 0;              // cap
         for (uint32_t j = 0; j < pairs; j++) {
             ReadUleb128(&p);                      // type_idx
             ReadUleb128(&p);                      // address
         }
         if (size <= 0) ReadUleb128(&p);           // catch_all_addr
     }
-    (void)handlers_base;
     return (size_t)(p - ci);
 }
 

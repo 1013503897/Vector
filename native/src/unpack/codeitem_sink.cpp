@@ -14,6 +14,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <utility>
 
 #include <common/logging.h>
 
@@ -215,6 +216,216 @@ void CodeItemSink::ObserveCodeItem(const void *code_item) {
     uint32_t id = (uint32_t)dex_count_++;
     ranges_.push_back({base, base + size, id});
     DumpDexLocked(base, size);
+}
+
+void CodeItemSink::DumpRegionContaining(const void *inner_ptr) {
+    if (!inited_ || !inner_ptr) return;
+    const uint8_t *inner = reinterpret_cast<const uint8_t *>(inner_ptr);
+    {
+        std::lock_guard<std::mutex> g(lock_);
+        if (FindRangeLocked(inner) >= 0) return;  // region already dumped — hot path
+    }
+    uintptr_t vstart = 0, vend = 0;
+    if (!FindMapping(reinterpret_cast<uintptr_t>(inner), &vstart, &vend, /*want_app=*/true))
+        return;  // not an app region (framework dex / unreadable) — fail closed
+    size_t rsize = vend - vstart;
+    if (rsize < sizeof(dex::Header) || rsize > (96u << 20)) return;
+
+    const uint8_t *live = reinterpret_cast<const uint8_t *>(vstart);
+    std::vector<uint8_t> buf(rsize);
+    InstallFaultGuard();
+    bool ok = ReadRegionGuarded(live, rsize, buf.data());
+    RemoveFaultGuard();
+    if (!ok) return;
+
+    std::lock_guard<std::mutex> g(lock_);
+    if (FindRangeLocked(live) >= 0) return;  // another thread won the race
+    uint32_t id = (uint32_t)dex_count_++;
+    ranges_.push_back({live, live + rsize, id});
+
+    // Raw region dump (header-agnostic) — keyed by live start so a mangled header doesn't matter.
+    char path[320];
+    snprintf(path, sizeof(path), "%s/region_%lx_%zu.bin", dir_, (unsigned long)vstart, rsize);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd >= 0) {
+        size_t off = 0;
+        while (off < rsize) {
+            ssize_t w = write(fd, buf.data() + off, rsize - off);
+            if (w <= 0) break;
+            off += (size_t)w;
+        }
+        fsync(fd);
+        close(fd);
+        LOGI("[unpack] region dump -> {} ({} bytes, inner +{})", path, off,
+             (size_t)(inner - live));
+    } else {
+        LOGW("[unpack] region dump open failed: {} (errno={})", path, errno);
+    }
+    // Bonus: if the region ALSO starts with (or contains near the start) a clean dex header,
+    // emit a proper .dex too so the common (non-mangled) case is directly jadx-loadable.
+    const uint8_t *b = buf.data();
+    if (dex::IsDexHeader(b)) {
+        uint32_t fsize = dex::DexFileSize(b);
+        if (fsize <= rsize) DumpDexLocked(b, fsize);
+    }
+}
+
+void CodeItemSink::DumpRegionsForPointers(const void *const *ptrs, size_t n) {
+    if (!inited_ || !ptrs || n == 0) return;
+
+    // 1. Snapshot /proc/self/maps ONCE (vs. reopening it per pointer). Readable regions only;
+    //    flag framework images (/system,/apex,/vendor,/product) so we never dump those.
+    struct Reg {
+        uintptr_t start, end;
+        bool app;
+    };
+    std::vector<Reg> regs;
+    {
+        FILE *f = fopen("/proc/self/maps", "re");
+        if (!f) return;
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            uintptr_t s = 0, e = 0;
+            char perms[5] = {0};
+            if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) != 3) continue;
+            if (perms[0] != 'r') continue;
+            bool app = true;
+            const char *path = strchr(line, '/');
+            if (path && (strncmp(path, "/system", 7) == 0 || strncmp(path, "/apex", 5) == 0 ||
+                         strncmp(path, "/vendor", 7) == 0 || strncmp(path, "/product", 8) == 0))
+                app = false;
+            regs.push_back({s, e, app});
+        }
+        fclose(f);
+    }
+    if (regs.empty()) return;  // maps order is ascending by start -> binary-searchable
+
+    // 2. Map every pointer to its region (largest start <= addr); mark distinct app regions.
+    std::vector<char> hit(regs.size(), 0);
+    for (size_t i = 0; i < n; i++) {
+        uintptr_t a = reinterpret_cast<uintptr_t>(ptrs[i]);
+        if (!a) continue;
+        size_t lo = 0, hi = regs.size();
+        while (lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            if (regs[mid].start <= a)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo == 0) continue;
+        size_t idx = lo - 1;
+        if (a < regs[idx].end && regs[idx].app) hit[idx] = 1;
+    }
+
+    // 3. Dump each distinct app region once, fault-guarded (one guard install for the whole pass).
+    InstallFaultGuard();
+    std::vector<uint8_t> buf;
+    size_t dumped = 0;
+    for (size_t i = 0; i < regs.size(); i++) {
+        if (!hit[i]) continue;
+        const uintptr_t s = regs[i].start, e = regs[i].end;
+        const size_t rsize = e - s;
+        if (rsize < sizeof(dex::Header) || rsize > (96u << 20)) continue;
+        const uint8_t *live = reinterpret_cast<const uint8_t *>(s);
+        {
+            std::lock_guard<std::mutex> g(lock_);
+            if (FindRangeLocked(live) >= 0) continue;  // already dumped (a prior scan/pass)
+        }
+        buf.resize(rsize);
+        if (!ReadRegionGuarded(live, rsize, buf.data())) continue;
+
+        std::lock_guard<std::mutex> g(lock_);
+        if (FindRangeLocked(live) >= 0) continue;
+        uint32_t id = (uint32_t)dex_count_++;
+        ranges_.push_back({live, live + rsize, id});
+
+        char path[320];
+        snprintf(path, sizeof(path), "%s/region_%lx_%zu.bin", dir_, (unsigned long)s, rsize);
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            size_t off = 0;
+            while (off < rsize) {
+                ssize_t w = write(fd, buf.data() + off, rsize - off);
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
+            fsync(fd);
+            close(fd);
+            dumped++;
+            LOGI("[unpack] region dump -> {} ({} bytes)", path, off);
+        }
+        const uint8_t *b = buf.data();
+        if (dex::IsDexHeader(b)) {  // bonus: clean dex at region start -> directly loadable
+            uint32_t fsize = dex::DexFileSize(b);
+            if (fsize <= rsize) DumpDexLocked(b, fsize);
+        }
+    }
+    RemoveFaultGuard();
+    LOGI("[unpack] dexfind: dumped {} distinct app region(s)", dumped);
+}
+
+size_t CodeItemSink::DumpMethodCaptures(const MethodCapture *caps, size_t n) {
+    if (!inited_ || !caps || n == 0) return 0;
+
+    // maps snapshot: classdef pointer -> owning region start (== the dumped region's key).
+    std::vector<std::pair<uintptr_t, uintptr_t>> regs;  // sorted [start,end)
+    {
+        FILE *f = fopen("/proc/self/maps", "re");
+        if (!f) return 0;
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            uintptr_t s = 0, e = 0;
+            char perms[5] = {0};
+            if (sscanf(line, "%lx-%lx %4s", &s, &e, perms) != 3) continue;
+            if (perms[0] == 'r') regs.emplace_back(s, e);
+        }
+        fclose(f);
+    }
+    if (regs.empty()) return 0;
+    auto region_of = [&](uintptr_t a) -> uintptr_t {
+        size_t lo = 0, hi = regs.size();
+        while (lo < hi) {
+            size_t m = (lo + hi) / 2;
+            if (regs[m].first <= a) lo = m + 1; else hi = m;
+        }
+        if (lo == 0) return 0;
+        return (a < regs[lo - 1].second) ? regs[lo - 1].first : 0;
+    };
+
+    char path[320];
+    snprintf(path, sizeof(path), "%s/captures.txt", dir_);
+    FILE *out = fopen(path, "we");
+    if (!out) {
+        LOGW("[unpack] captures.txt open failed (errno={})", errno);
+        return 0;
+    }
+
+    // The CodeItem bytes are already a SAFE caller-owned copy (the finder copied them in the
+    // trigger before the shell recycled the side structure), so no fault guard / live read here:
+    // just resolve the owning dex region and hex-write the bytes.
+    static char hexbuf[1 << 16];
+    static const char *H = "0123456789abcdef";
+    size_t written = 0;
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t *b = caps[i].bytes;
+        uint32_t len = caps[i].len;
+        if (!b || len == 0 || len > sizeof(hexbuf) / 2) continue;
+        uintptr_t rs = region_of(reinterpret_cast<uintptr_t>(caps[i].classdef));
+        if (!rs) continue;  // owning dex not in a readable region
+        for (uint32_t k = 0; k < len; k++) {
+            hexbuf[k * 2] = H[b[k] >> 4];
+            hexbuf[k * 2 + 1] = H[b[k] & 0xf];
+        }
+        fprintf(out, "%lx %u ", (unsigned long)rs, caps[i].method_idx);
+        fwrite(hexbuf, 1, len * 2, out);
+        fputc('\n', out);
+        written++;
+    }
+    fclose(out);
+    capture_count_ += written;
+    LOGI("[unpack] captures: wrote {} method CodeItem(s) -> {}", written, path);
+    return written;
 }
 
 void CodeItemSink::ScanProcessForDexes() {

@@ -41,9 +41,41 @@ public:
     // is for active/per-method tiers, not the P0-simple whole-dex path. Concurrency-safe.
     void ObserveCodeItem(const void *code_item);
 
+    // Direction-1 increment-1 (extraction / header-mangled in-memory dex): given a pointer
+    // KNOWN to lie inside a live dex (e.g. mirror::Class::GetClassDef() -> dex::ClassDef*),
+    // dump the WHOLE containing /proc/self/maps region WITHOUT validating a dex header. This
+    // recovers dexes that ScanProcessForDexes misses because the packer (NetEase Yidun) mangles
+    // the in-memory header so IsDexHeader rejects the region. Region-deduped; fault-guarded.
+    // Writes <dir>/region_<hexstart>_<size>.bin (raw) and, if a valid dex header is also found
+    // at the region start, a clean <dir>/dump_*.dex too. Concurrency-safe.
+    void DumpRegionContaining(const void *inner_ptr);
+
+    // Batch form of DumpRegionContaining for the class enumerator (tens of thousands of
+    // ClassDef pointers, most in framework dexes): snapshots /proc/self/maps ONCE, resolves
+    // every pointer to its region by binary search, then dumps each DISTINCT app region a
+    // single time. Avoids the O(N) re-parse of maps that DumpRegionContaining would incur per
+    // pointer. `ptrs` are inner pointers (e.g. dex::ClassDef*). Region-deduped; fault-guarded.
+    void DumpRegionsForPointers(const void *const *ptrs, size_t n);
+
     // P0-design entries (per-method CodeItem capture). Kept for the extraction-shell path.
     uint32_t RegisterDex(const void *begin, size_t size);
     void Capture(const CaptureRecord &rec);
+
+    // increment-2b (side-cache extraction shells, e.g. dpt-shell): one restored CodeItem per
+    // method, already copied to a SAFE caller-owned buffer. The finder copies the CodeItem bytes
+    // the instant GetCodeItem returns (the restored CodeItem lives in a transient side structure
+    // that the shell recycles, so the pointer goes stale by the time the worker would read it).
+    // `classdef` locates the owning dex (its /proc/self/maps region == the dumped region);
+    // `method_idx` is the dex method index; `bytes`/`len` are the safe CodeItem copy. The sink just
+    // resolves classdef -> region and writes <dir>/captures.txt lines
+    // "<region_start_hex> <method_idx> <codeitem_hex>" for the offline splicer.
+    struct MethodCapture {
+        const void *classdef;
+        uint32_t method_idx;
+        const uint8_t *bytes;
+        uint32_t len;
+    };
+    size_t DumpMethodCaptures(const MethodCapture *caps, size_t n);
 
     // Persist everything for offline reassembly.
     void Flush();

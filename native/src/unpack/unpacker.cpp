@@ -19,7 +19,9 @@
 
 #include <common/logging.h>
 
+#include "unpack/art_internal.h"      // CalibrateForMethodEnum (increment-2)
 #include "unpack/choke_hook.h"        // ChokePoint
+#include "unpack/class_dex_finder.h"  // FindAndDumpClassDexes (direction-1 increment-1/2)
 #include "unpack/codeitem_sink.h"
 #include "unpack/method_enumerator.h" // Tier, EnumerateAndDrive
 
@@ -33,6 +35,8 @@ struct Config {
     Tier tier = Tier::kPassive;                            // .tier = A|B|C (P0 = A)
     bool stealth = false;                                  // .stealth = 0|1
     ChokePoint choke = ChokePoint::kArtMethodGetCodeItem;  // .choke = getcodeitem|invoke|bridge|execute
+    bool dexfind = false;                                  // .dexfind = 1 (direction-1 increment-1)
+    bool trigger = false;                                  // .trigger = 1 (increment-2 per-method restore)
 };
 
 bool PropIs(const char *name, char want) {
@@ -103,15 +107,48 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     // app within a few seconds. So scan IMMEDIATELY and repeatedly with a sub-second interval to
     // catch the decrypted dex(es) inside that brief window, whenever they materialize
     // (range-deduped -> already-dumped dexes are skipped cheaply). Props tune the burst.
-    int rounds = PropInt("persist.kpmhook.unpack.rounds", 40);
-    int interval_ms = PropInt("persist.kpmhook.unpack.interval_ms", 400);
-    if (rounds < 1) rounds = 1;
-    if (interval_ms < 1) interval_ms = 1;
-    LOGI("[unpack] scanning {} round(s) every {}ms (immediate start)", rounds, interval_ms);
-    for (int r = 0; r < rounds; r++) {
-        sink.ScanProcessForDexes();                       // scan FIRST -> catch fast-exit packers
-        if (r + 1 < rounds) usleep((useconds_t)interval_ms * 1000);
+    //
+    // SKIP the burst when dexfind is on: (1) dexfind is strictly superior — it reaches every loaded
+    // dex via ART (incl. header-mangled ones the scan can't validate), so the burst adds nothing;
+    // (2) the burst's heavy page-by-page read + process-wide SIGSEGV fault-guard CONFLICTS with
+    // signal/lazy-restore shells (dpt-shell crashed the app at pc=0 during the burst, but runs fine
+    // under dexfind-only). dexfind's region reads touch only the few loaded-dex regions.
+    if (!cfg.dexfind) {
+        int rounds = PropInt("persist.kpmhook.unpack.rounds", 40);
+        int interval_ms = PropInt("persist.kpmhook.unpack.interval_ms", 400);
+        if (rounds < 1) rounds = 1;
+        if (interval_ms < 1) interval_ms = 1;
+        LOGI("[unpack] scanning {} round(s) every {}ms (immediate start)", rounds, interval_ms);
+        for (int r = 0; r < rounds; r++) {
+            sink.ScanProcessForDexes();                   // scan FIRST -> catch fast-exit packers
+            if (r + 1 < rounds) usleep((useconds_t)interval_ms * 1000);
+        }
+    } else {
+        LOGI("[unpack] dexfind on -> skipping the whole-dex burst scan (superseded)");
     }
+
+    // Direction-1 increment-1: per-class dex discovery. The whole-dex scan above MISSES dexes
+    // whose in-memory header the packer mangles (NetEase Yidun extracts/loads its real classes.dex
+    // in-memory with a corrupted header). This asks ART directly — VisitClasses -> GetClassDef
+    // gives a pointer into each live dex -> dump the containing region header-agnostically. Run
+    // AFTER the burst so the app has loaded its real classes; enumeration runs on a runnable app
+    // thread (captured via a transient ClassLinker::FindClass hook).
+    if (cfg.dexfind) {
+        bool trig = cfg.trigger;
+        if (trig) {
+            // Calibrate the ArtMethod ABI (size + mirror::Class.methods_ offset) so the finder can
+            // enumerate per-class ArtMethods and force-restore their CodeItems (increment-2).
+            if (art::CalibrateForMethodEnum(env)) {
+                LOGI("[unpack] dexfind: ArtMethod ABI calibrated -> per-method trigger ON");
+            } else {
+                LOGW("[unpack] dexfind: ArtMethod ABI calibration failed -> dump-only");
+                trig = false;
+            }
+        }
+        size_t recovered = FindAndDumpClassDexes(&sink, env, 10000, trig);
+        LOGI("[unpack] dexfind: {} region(s) recovered (trigger={})", recovered, trig);
+    }
+
     sink.Flush();
 
     if (hooked) RemoveChokeHook();  // P0: one-shot
@@ -125,6 +162,8 @@ Config ReadConfigFromProps() {
     c.tier = ParseTier();
     c.stealth = PropIs("persist.kpmhook.unpack.stealth", '1');
     c.choke = ParseChoke();
+    c.dexfind = PropIs("persist.kpmhook.unpack.dexfind", '1');
+    c.trigger = PropIs("persist.kpmhook.unpack.trigger", '1');
     return c;
 }
 
