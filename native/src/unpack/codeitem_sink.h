@@ -93,6 +93,9 @@ private:
     long FindRangeLocked(const uint8_t *inner) const;
     // Dump [base, base+size) to <dir>/dump_<checksum>_<size>.dex. Caller holds lock_.
     void DumpDexLocked(const uint8_t *base, size_t size);
+    // On-device dexfixer: reconstruct valid .dex(es) from a SAFE region copy by header invariants
+    // (rebuild magic + adler32 + sha1) -> <dir>/region_<start>_<size>_fixed.dex. Caller holds lock_.
+    void ReconstructDexesFromRegion(const uint8_t *region, size_t size, uintptr_t region_start);
 
     std::mutex lock_;
     std::vector<DexRange> ranges_;
