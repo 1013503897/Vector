@@ -91,6 +91,82 @@ size_t CodeItemLength(const uint8_t *ci) {
     return (size_t)(p - ci);
 }
 
+// ---- class-descriptor enumeration (increment-2d) -----------------------------------------
+
+namespace {
+inline uint32_t Rd32(const uint8_t *p) { return *reinterpret_cast<const uint32_t *>(p); }
+}  // namespace
+
+const uint8_t *LocateDexByInvariants(const uint8_t *from, const uint8_t *region_end) {
+    if (!from || region_end <= from) return nullptr;
+    // The invariant pair sits at dex_base+0x24 (header_size) / +0x28 (endian). Scan for it, then
+    // back up 0x24 to the dex base. 4-byte-aligned (the header is u4-aligned in every dex).
+    const uint8_t *start = reinterpret_cast<const uint8_t *>(
+        (reinterpret_cast<uintptr_t>(from) + 3) & ~uintptr_t(3));
+    for (const uint8_t *x = start; x + 8 <= region_end; x += 4) {
+        if (Rd32(x) != kHeaderSize) continue;
+        if (Rd32(x + 4) != kEndianTag) continue;
+        const uint8_t *base = x - 0x24;
+        if (base < from) continue;
+        if (base + 0x70 > region_end) continue;          // must be able to read the full header
+        uint32_t fsz = Rd32(base + 0x20);                // file_size
+        if (fsz < kHeaderSize || fsz > (256u << 20)) continue;
+        if (base + fsz > region_end) continue;
+        return base;
+    }
+    return nullptr;
+}
+
+size_t EnumerateClassDescriptors(const uint8_t *dex_base, const uint8_t *region_end,
+                                 DescriptorCb cb, void *ctx) {
+    if (!dex_base || !cb || region_end <= dex_base + 0x70) return 0;
+    auto in = [&](const uint8_t *p, size_t n) { return p >= dex_base && p + n <= region_end; };
+
+    uint32_t string_ids_size = Rd32(dex_base + 0x38);
+    uint32_t string_ids_off = Rd32(dex_base + 0x3c);
+    uint32_t type_ids_size = Rd32(dex_base + 0x40);
+    uint32_t type_ids_off = Rd32(dex_base + 0x44);
+    uint32_t class_defs_size = Rd32(dex_base + 0x60);
+    uint32_t class_defs_off = Rd32(dex_base + 0x64);
+    // Sanity: section tables must lie within the region.
+    if (!string_ids_size || !type_ids_size || !class_defs_size) return 0;
+    if (class_defs_size > (1u << 22) || type_ids_size > (1u << 22) || string_ids_size > (1u << 23))
+        return 0;
+    const uint8_t *sids = dex_base + string_ids_off;
+    const uint8_t *tids = dex_base + type_ids_off;
+    const uint8_t *cdefs = dex_base + class_defs_off;
+    if (!in(sids, (size_t)string_ids_size * 4)) return 0;
+    if (!in(tids, (size_t)type_ids_size * 4)) return 0;
+    if (!in(cdefs, (size_t)class_defs_size * 0x20)) return 0;
+
+    size_t n = 0;
+    for (uint32_t ci = 0; ci < class_defs_size; ci++) {
+        uint32_t class_idx = Rd32(cdefs + (size_t)ci * 0x20);       // class_def.class_idx
+        if (class_idx >= type_ids_size) continue;
+        uint32_t str_idx = Rd32(tids + (size_t)class_idx * 4);      // type_id -> descriptor str idx
+        if (str_idx >= string_ids_size) continue;
+        uint32_t str_off = Rd32(sids + (size_t)str_idx * 4);        // string_id -> string_data_off
+        const uint8_t *p = dex_base + str_off;
+        if (!in(p, 1)) continue;
+        // Skip the uleb128 utf16_size (<=5 bytes), then the MUTF8 bytes follow (NUL-terminated).
+        const uint8_t *q = p;
+        for (int k = 0; k < 5 && in(q, 1); k++) {
+            uint8_t b = *q++;
+            if (!(b & 0x80)) break;
+        }
+        // Bound the descriptor: must be NUL-terminated within 512 bytes and the region.
+        const char *desc = reinterpret_cast<const char *>(q);
+        const uint8_t *limit = q + 512 < region_end ? q + 512 : region_end;
+        const uint8_t *e = q;
+        while (e < limit && *e) e++;
+        if (e >= limit || *e != 0) continue;           // not terminated in bound -> skip
+        if (desc[0] != 'L') continue;                  // only class types (skip arrays/primitives)
+        cb(desc, ctx);
+        n++;
+    }
+    return n;
+}
+
 }  // namespace vector::native::unpack::dex
 
 #endif  // VECTOR_UNPACK_ENABLED

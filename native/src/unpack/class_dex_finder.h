@@ -29,6 +29,11 @@ class CodeItemSink;
 // dumping, the worker calls ArtMethod::GetCodeItem on each — which forces an extraction shell to
 // restore each method's CodeItem in place. The dump then captures the now-complete dex. Harmless
 // on whole-dex shells (CodeItems already present).
-size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger);
+// increment-2d: when `active_load` is true, AFTER enumeration and BEFORE the region dump, every
+// class of the app's loaded dex(es) is Class.forName'd (active_load.h) so a per-class extraction
+// shell (dpt) restores all CodeItems in place — recovering classes the app never reached. The dump
+// then captures the restored code.
+size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger,
+                             bool active_load);
 
 }  // namespace vector::native::unpack

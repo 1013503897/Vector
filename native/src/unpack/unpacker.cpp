@@ -39,6 +39,7 @@ struct Config {
     bool dexfind = false;                                  // .dexfind = 1 (direction-1 increment-1)
     bool trigger = false;                                  // .trigger = 1 (increment-2 per-method restore)
     bool interp = false;                                   // .interp = 1 (increment-2c interpreter capture)
+    bool active_load = false;                              // .activeload = 1 (increment-2d force-load all classes)
 };
 
 bool PropIs(const char *name, char want) {
@@ -127,7 +128,7 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     // (2) the burst's heavy page-by-page read + process-wide SIGSEGV fault-guard CONFLICTS with
     // signal/lazy-restore shells (dpt-shell crashed the app at pc=0 during the burst, but runs fine
     // under dexfind-only). dexfind's region reads touch only the few loaded-dex regions.
-    if (!cfg.dexfind && !cfg.interp) {
+    if (!cfg.dexfind && !cfg.interp && !cfg.active_load) {
         int rounds = PropInt("persist.kpmhook.unpack.rounds", 40);
         int interval_ms = PropInt("persist.kpmhook.unpack.interval_ms", 400);
         if (rounds < 1) rounds = 1;
@@ -149,7 +150,7 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     // thread (captured via a transient ClassLinker::FindClass hook).
     // Also run for interp mode: the per-class region dump gives the offline splicer its target dexes
     // (whose nop'd CodeItems the interp captures replace). interp-only skips the GetCodeItem trigger.
-    if (cfg.dexfind || cfg.interp) {
+    if (cfg.dexfind || cfg.interp || cfg.active_load) {
         bool trig = cfg.dexfind && cfg.trigger;
         if (trig) {
             // Calibrate the ArtMethod ABI (size + mirror::Class.methods_ offset) so the finder can
@@ -161,8 +162,9 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
                 trig = false;
             }
         }
-        size_t recovered = FindAndDumpClassDexes(&sink, env, 10000, trig);
-        LOGI("[unpack] dexfind: {} region(s) recovered (trigger={})", recovered, trig);
+        size_t recovered = FindAndDumpClassDexes(&sink, env, 10000, trig, cfg.active_load);
+        LOGI("[unpack] dexfind: {} region(s) recovered (trigger={} activeload={})", recovered, trig,
+             cfg.active_load);
     }
 
     sink.Flush();
@@ -181,6 +183,7 @@ Config ReadConfigFromProps() {
     c.dexfind = PropIs("persist.kpmhook.unpack.dexfind", '1');
     c.trigger = PropIs("persist.kpmhook.unpack.trigger", '1');
     c.interp = PropIs("persist.kpmhook.unpack.interp", '1');
+    c.active_load = PropIs("persist.kpmhook.unpack.activeload", '1');
     return c;
 }
 

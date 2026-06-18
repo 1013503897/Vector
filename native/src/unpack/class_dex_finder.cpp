@@ -17,6 +17,7 @@
 
 #include <common/logging.h>
 
+#include "unpack/active_load.h"  // ActiveLoadAllClasses (increment-2d)
 #include "unpack/art_internal.h"
 #include "unpack/codeitem_sink.h"
 #include "unpack/dex_layout.h"  // CodeItemLength
@@ -219,7 +220,8 @@ void *FindClassHook(void *thiz, void *self, const char *desc, size_t hash, void 
 
 }  // namespace
 
-size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger) {
+size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger,
+                             bool active_load) {
     if (!sink) return 0;
     const auto &I = art::Get();
     if (!I.ok_for_dexfind()) {
@@ -304,6 +306,13 @@ size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, boo
     LOGI("[unpack] dexfind: enumerated {} class-def(s), {} method(s); triggered {} CodeItem(s), "
          "{} skipped(faulted)",
          defs.size(), methods.size(), g_triggered.load(), g_tg_skipped.load());
+
+    // increment-2d: force-load every class of the app dex(es) so a per-class extraction shell
+    // restores ALL CodeItems in place (incl. classes the app never reached), THEN dump.
+    if (active_load && jni_env) {
+        size_t loaded = ActiveLoadAllClasses(jni_env, defs.data(), defs.size());
+        LOGI("[unpack] dexfind: active-loaded {} class(es) before dump", loaded);
+    }
 
     size_t before = sink->dex_count();
     sink->DumpRegionsForPointers(defs.data(), defs.size());  // single maps snapshot + dedup

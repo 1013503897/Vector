@@ -59,4 +59,22 @@ inline uint32_t DexChecksum(const uint8_t *dex_base) {
 // Returns the total byte length, or 0 if it cannot be computed safely.
 size_t CodeItemLength(const uint8_t *code_item);
 
+// ---- class-descriptor enumeration (increment-2d active class-loading) ----
+//
+// Locate a dex image by its INVARIANT fields (header_size==0x70 @ +0x24, endian_tag @ +0x28),
+// NOT the magic — so it finds a packer's in-memory dex even when the shell mangled the magic /
+// checksum (dpt / Yidun). Scans 4-byte-aligned from `from` up to `region_end`; returns the dex
+// base whose [base, base+file_size) fits within `region_end`, or nullptr if none. For the next
+// dex in a multi-dex region, pass `from = base + DexFileSize(base)`.
+const uint8_t *LocateDexByInvariants(const uint8_t *from, const uint8_t *region_end);
+
+// Enumerate every class descriptor ("Lcom/foo/Bar;") in the dex at `dex_base`, calling
+// cb(descriptor, ctx) once per class_def. The descriptor is a NUL-terminated C-string pointing
+// into the live dex (valid only during the call). `region_end` bounds every read; section offsets
+// come straight from the header (intact even when magic is mangled). Bounds-checked + length-capped
+// so it never faults within the region. Returns the count enumerated (0 if the header looks wrong).
+using DescriptorCb = void (*)(const char *descriptor, void *ctx);
+size_t EnumerateClassDescriptors(const uint8_t *dex_base, const uint8_t *region_end,
+                                 DescriptorCb cb, void *ctx);
+
 }  // namespace vector::native::unpack::dex
