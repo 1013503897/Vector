@@ -23,6 +23,7 @@
 #include "unpack/choke_hook.h"        // ChokePoint
 #include "unpack/class_dex_finder.h"  // FindAndDumpClassDexes (direction-1 increment-1/2)
 #include "unpack/codeitem_sink.h"
+#include "unpack/interp_capture.h"    // CaptureInterpreted (direction-1 increment-2c)
 #include "unpack/method_enumerator.h" // Tier, EnumerateAndDrive
 
 namespace vector::native::unpack {
@@ -37,6 +38,7 @@ struct Config {
     ChokePoint choke = ChokePoint::kArtMethodGetCodeItem;  // .choke = getcodeitem|invoke|bridge|execute
     bool dexfind = false;                                  // .dexfind = 1 (direction-1 increment-1)
     bool trigger = false;                                  // .trigger = 1 (increment-2 per-method restore)
+    bool interp = false;                                   // .interp = 1 (increment-2c interpreter capture)
 };
 
 bool PropIs(const char *name, char want) {
@@ -93,6 +95,18 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     static CodeItemSink sink;
     sink.Init(out_dir.c_str());
 
+    // increment-2c: interpreter-point capture (FART-style) — the ONLY way to recover a side-cache /
+    // DefineClass-restore extraction shell (dpt-shell), whose real CodeItems GetCodeItem (2b) can't
+    // see. Hook art::interpreter::Execute FIRST (this fires near app startup, before the app runs
+    // its own methods) and capture for a window while the app initializes + the operator drives it.
+    // The structure dexes themselves are dumped by the dexfind pass below (same region keys), so the
+    // offline splicer can graft the captured CodeItems back in.
+    if (cfg.interp) {
+        int interp_ms = PropInt("persist.kpmhook.unpack.interp_ms", 30000);
+        size_t ncap = CaptureInterpreted(&sink, interp_ms);
+        LOGI("[unpack] interp: {} method CodeItem(s) captured over {}ms", ncap, interp_ms);
+    }
+
     // The CodeItem-restore choke is only useful for the active/per-method tiers; the P0-simple
     // whole-dex path is a /proc/self/maps scan (immune to libart inlining GetCodeItem).
     bool hooked = false;
@@ -113,7 +127,7 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     // (2) the burst's heavy page-by-page read + process-wide SIGSEGV fault-guard CONFLICTS with
     // signal/lazy-restore shells (dpt-shell crashed the app at pc=0 during the burst, but runs fine
     // under dexfind-only). dexfind's region reads touch only the few loaded-dex regions.
-    if (!cfg.dexfind) {
+    if (!cfg.dexfind && !cfg.interp) {
         int rounds = PropInt("persist.kpmhook.unpack.rounds", 40);
         int interval_ms = PropInt("persist.kpmhook.unpack.interval_ms", 400);
         if (rounds < 1) rounds = 1;
@@ -124,7 +138,7 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
             if (r + 1 < rounds) usleep((useconds_t)interval_ms * 1000);
         }
     } else {
-        LOGI("[unpack] dexfind on -> skipping the whole-dex burst scan (superseded)");
+        LOGI("[unpack] dexfind/interp on -> skipping the whole-dex burst scan (superseded)");
     }
 
     // Direction-1 increment-1: per-class dex discovery. The whole-dex scan above MISSES dexes
@@ -133,8 +147,10 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     // gives a pointer into each live dex -> dump the containing region header-agnostically. Run
     // AFTER the burst so the app has loaded its real classes; enumeration runs on a runnable app
     // thread (captured via a transient ClassLinker::FindClass hook).
-    if (cfg.dexfind) {
-        bool trig = cfg.trigger;
+    // Also run for interp mode: the per-class region dump gives the offline splicer its target dexes
+    // (whose nop'd CodeItems the interp captures replace). interp-only skips the GetCodeItem trigger.
+    if (cfg.dexfind || cfg.interp) {
+        bool trig = cfg.dexfind && cfg.trigger;
         if (trig) {
             // Calibrate the ArtMethod ABI (size + mirror::Class.methods_ offset) so the finder can
             // enumerate per-class ArtMethods and force-restore their CodeItems (increment-2).
@@ -164,6 +180,7 @@ Config ReadConfigFromProps() {
     c.choke = ParseChoke();
     c.dexfind = PropIs("persist.kpmhook.unpack.dexfind", '1');
     c.trigger = PropIs("persist.kpmhook.unpack.trigger", '1');
+    c.interp = PropIs("persist.kpmhook.unpack.interp", '1');
     return c;
 }
 

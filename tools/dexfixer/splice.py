@@ -65,14 +65,18 @@ def codeitem_len(buf, off):
 
 
 def method_codeoffs(dex):
-    """{dex_method_index: code_off} for every method, via class_data walk."""
+    """Walk every class_data. Returns:
+       coffs       {dex_method_index: code_off}
+       midx_class  {dex_method_index: class_def_index}   (to locate the owning class_data to rebuild)
+       class_cdo   {class_def_index: class_data_off}"""
     u4 = lambda o: struct.unpack_from('<I', dex, o)[0]
     cdef_sz, cdef_off = u4(0x60), u4(0x64)
-    out = {}
+    coffs, midx_class, class_cdo = {}, {}, {}
     for ci in range(cdef_sz):
         cdo = u4(cdef_off + ci * 0x20 + 24)
         if cdo == 0:
             continue
+        class_cdo[ci] = cdo
         o = cdo
         sf, o = uleb(dex, o); inf, o = uleb(dex, o); dm, o = uleb(dex, o); vm, o = uleb(dex, o)
         for _ in range(sf):
@@ -85,12 +89,56 @@ def method_codeoffs(dex):
                 diff, o = uleb(dex, o); midx = diff if k == 0 else midx + diff
                 _, o = uleb(dex, o)             # access_flags
                 coff, o = uleb(dex, o)          # code_off
+                midx_class[midx] = ci
                 if coff:
-                    out[midx] = coff
+                    coffs[midx] = coff
+    return coffs, midx_class, class_cdo
+
+
+def enc_uleb(v):
+    out = bytearray()
+    while True:
+        b = v & 0x7f
+        v >>= 7
+        if v:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return out
+
+
+def class_data_off(dex, class_idx):
+    """ClassDef.class_data_off (u4) field OFFSET inside the dex for a given class_def index."""
+    cdef_off = struct.unpack_from('<I', dex, 0x64)[0]
+    return cdef_off + class_idx * 0x20 + 24
+
+
+def rebuild_class_data(dex, cdo, new_offs):
+    """Re-emit the class_data_item at offset `cdo`, replacing code_off for any method whose
+    dex_method_index is in `new_offs` ({midx: new_code_off}). Returns the new class_data bytes.
+    Fields are copied verbatim (only method code_offs change)."""
+    o = cdo
+    sf, o = uleb(dex, o); inf, o = uleb(dex, o); dm, o = uleb(dex, o); vm, o = uleb(dex, o)
+    out = bytearray()
+    out += enc_uleb(sf); out += enc_uleb(inf); out += enc_uleb(dm); out += enc_uleb(vm)
+    for _ in range(sf + inf):                     # encoded_field[]: idx_diff, access_flags
+        a, o = uleb(dex, o); b, o = uleb(dex, o)
+        out += enc_uleb(a); out += enc_uleb(b)
+    for grp in (dm, vm):                          # encoded_method[]: idx_diff, access, code_off
+        midx = 0
+        for k in range(grp):
+            diff, o = uleb(dex, o); midx = diff if k == 0 else midx + diff
+            acc, o = uleb(dex, o)
+            coff, o = uleb(dex, o)
+            if midx in new_offs:
+                coff = new_offs[midx]
+            out += enc_uleb(diff); out += enc_uleb(acc); out += enc_uleb(coff)
     return out
 
 
 def fixsig(dex):
+    # file_size (u4 @ 0x20) must match the (possibly grown) image, else strict loaders reject it.
+    struct.pack_into('<I', dex, 0x20, len(dex))
     dex[12:32] = hashlib.sha1(bytes(dex[32:])).digest()
     struct.pack_into('<I', dex, 8, zlib.adler32(bytes(dex[12:])) & 0xffffffff)
 
@@ -137,11 +185,25 @@ def main():
             print(f"  region {region}: no matching *_fixed.dex (skipped, {len(caps)} caps)")
             continue
         dex = bytearray(open(os.path.join(d, match), 'rb').read())
-        coffs = method_codeoffs(dex)
+        coffs, midx_class, class_cdo = method_codeoffs(dex)
         patched = same = grew = missing = 0
+        # Methods whose captured CodeItem differs in size from the in-dex stub can't be overwritten
+        # in place; collect them per owning class for append+repoint below.
+        repoint = {}     # class_idx -> {midx: new_code_off}
+        append = bytearray()
+        base = (len(dex) + 3) & ~3   # appended items start 4-aligned after the current image
+
+        def emit(code):
+            nonlocal append
+            pad = (-len(append)) & 3
+            append += b'\x00' * pad
+            off = base + len(append)
+            append += code
+            return off
+
         for midx, code in caps:
             co = coffs.get(midx)
-            if not co:
+            if co is None:
                 missing += 1
                 continue
             try:
@@ -149,15 +211,33 @@ def main():
             except Exception:
                 cur = -1
             if cur == len(code):
-                dex[co:co + len(code)] = code         # in-place overwrite (dpt: same size)
+                dex[co:co + len(code)] = code         # in-place overwrite (same size)
                 same += 1; patched += 1
             else:
-                grew += 1                              # size differs -> would need repoint (rare)
+                ci = midx_class.get(midx)
+                if ci is None or ci not in class_cdo:
+                    missing += 1
+                    continue
+                repoint.setdefault(ci, {})[midx] = emit(code)   # append, remember new code_off
+                grew += 1; patched += 1
+
+        # Rebuild each affected class's class_data with the new code_offs, append it, and repoint
+        # the (fixed-width u4) ClassDef.class_data_off — no in-place uleb resize needed.
+        if repoint:
+            dex += b'\x00' * ((-len(dex)) & 3)
+            dex += append                              # bring appended code items into the image
+            for ci, new_offs in repoint.items():
+                new_cd = rebuild_class_data(dex, class_cdo[ci], new_offs)
+                dex += b'\x00' * ((-len(dex)) & 3)
+                cd_off = len(dex)
+                dex += new_cd
+                struct.pack_into('<I', dex, class_data_off(dex, ci), cd_off)
+
         fixsig(dex)
         out = os.path.join(out_dir, match.replace('_fixed.dex', '_spliced.dex'))
         open(out, 'wb').write(dex)
-        print(f"  {match}: {len(caps)} caps -> patched={patched} (in-place={same}) "
-              f"size-mismatch={grew} idx-missing={missing} -> {os.path.basename(out)}")
+        print(f"  {match}: {len(caps)} caps -> patched={patched} (in-place={same} "
+              f"append+repoint={grew}) idx-missing={missing} -> {os.path.basename(out)}")
     print(f"done -> {out_dir}")
 
 

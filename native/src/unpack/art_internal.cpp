@@ -79,6 +79,12 @@ void DoResolve() {
     I.class_linker_find_class = art->getSymbAddress(
         "_ZN3art11ClassLinker9FindClassEPNS_6ThreadEPKcmNS_6HandleINS_6mirror11ClassLoaderEEE");
 
+    // Increment-2c: art::interpreter::Execute — a local (L) symbol with a build-specific
+    // `.__uniq.N.llvm.N` suffix, present only in the LZMA .symtab inside .gnu_debugdata. Resolve
+    // by PREFIX so the suffix (which differs per build) doesn't have to be hardcoded.
+    I.interpreter_execute = const_cast<void *>(
+        art->getSymbPrefixFirstAddress<const void *>("_ZN3art11interpreterL7ExecuteE"));
+
     // Force-compile driver — identical symbols to module.cpp ForceCompileMethod.
     I.runtime_instance = reinterpret_cast<void **>(
         art->getSymbAddress("_ZN3art7Runtime9instance_E"));
@@ -99,6 +105,7 @@ void DoResolve() {
          (void *)I.runtime_get_jit, (void *)I.jit_enqueue_optimized_compilation);
     LOGI("[unpack] dexfind surface: get_class_def={} find_class={}",
          (void *)I.mirror_class_get_class_def, (void *)I.class_linker_find_class);
+    LOGI("[unpack] interp-capture surface: interpreter_execute={}", (void *)I.interpreter_execute);
 }
 
 }  // namespace
@@ -117,6 +124,9 @@ bool Internal::ok_for_forcecompile() const {
 }
 bool Internal::ok_for_dexfind() const {
     return class_linker_visit_classes && mirror_class_get_class_def && class_linker_find_class;
+}
+bool Internal::ok_for_interp_capture() const {
+    return interpreter_execute && mirror_class_get_class_def;
 }
 
 const Internal &Get() {

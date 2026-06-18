@@ -49,6 +49,16 @@ struct Internal {
     // every class load, so the capture is immediate; the finder unhooks right after.
     void *class_linker_find_class = nullptr;
 
+    // ---- direction-1 increment-2c: interpreter-point capture (FART-style) ----
+    // art::interpreter::Execute(Thread*, const CodeItemDataAccessor&, ShadowFrame&, JValue, bool,
+    // bool) — the unified switch-interpreter entry every interpreted method passes through.
+    // Resolved by PREFIX (the symbol carries a build-specific `.__uniq.N.llvm.N` suffix, and lives
+    // in the LZMA .symtab inside .gnu_debugdata, not .dynsym). Hooking it captures the REAL CodeItem
+    // (via the accessor arg) at the instant a method interprets — the ONLY point a side-cache /
+    // DefineClass-restore extraction shell (dpt-shell) exposes real code; ArtMethod::GetCodeItem
+    // returns the nop'd in-place stub there. Stored as void*; called via a local typedef.
+    void *interpreter_execute = nullptr;
+
     // ---- active driver: force-compile (Tier-B, reuse of ForceCompileMethod, §3) ----
     void **runtime_instance = nullptr;                          // art::Runtime::instance_
     void *(*runtime_get_jit)(void *runtime) = nullptr;          // Runtime::GetJit (often INLINED -> null; then derive jit_ via offset, see .cpp)
@@ -70,6 +80,11 @@ struct Internal {
     size_t class_methods_off = 0;          // mirror::Class.methods_ (u64) — 0 until calibrated
     size_t class_methods_data_off = 0;     // LengthPrefixedArray<ArtMethod> element-0 offset
 
+    // ---- increment-2c: ShadowFrame ABI ----
+    // ShadowFrame.method_ byte offset. Layout is { ShadowFrame* link_@+0; ArtMethod* method_@+8;
+    // ... }, stable across modern ART; ShadowFrame::GetMethod() is inlined so there's no symbol.
+    size_t shadow_frame_method_off = 8;
+
     bool methods_calibrated() const { return art_method_size && class_methods_off; }
 
     // Read the method's quick-compiled entry (pure read; same as ForceCompileMethod).
@@ -80,6 +95,7 @@ struct Internal {
     bool ok_for_enumerate() const; // P1: + visit_classes
     bool ok_for_forcecompile() const; // P1 Tier-B: + runtime_instance + enqueue
     bool ok_for_dexfind() const;   // Increment-1: visit_classes + get_class_def + find_class
+    bool ok_for_interp_capture() const;  // Increment-2c: interpreter_execute + get_class_def
 };
 
 // Lazily resolves once and caches. Thread-safe one-time init (cf. ElfSymbolCache).
