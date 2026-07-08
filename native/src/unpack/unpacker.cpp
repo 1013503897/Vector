@@ -8,16 +8,31 @@
 
 #include "unpack/unpacker.h"
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
 #include <common/logging.h>
+
+// Traceless KPM backend (defined in native/src/kpm, declared in core/native_api.h). Forward-
+// declared here so the openat probe can call kpm_inline_hooker DIRECTLY -- traceless-ONLY, with
+// NO Dobby fallback (a Dobby/inline patch gets the process SIGKILL'd by anti-tamper guards).
+extern "C" void *kpm_inline_hooker(void *target, void *hooker);
+extern "C" int kpm_inline_unhooker(void *func);
+// Identify this process to the KPM's proc_is_target() gate (which compares against
+// persist.kpmhook.target). Vector's normal path sets this in module.cpp, but only AFTER
+// StartIfEnabled and only for in-scope apps -- so the traceless worker must set it itself
+// or the gate latches g_init_failed on the stale "zygote64" cmdline.
+extern "C" void kpm_hook_set_process_name(const char *name);
 
 #include "unpack/art_internal.h"      // CalibrateForMethodEnum (increment-2)
 #include "unpack/choke_hook.h"        // ChokePoint
@@ -40,7 +55,96 @@ struct Config {
     bool trigger = false;                                  // .trigger = 1 (increment-2 per-method restore)
     bool interp = false;                                   // .interp = 1 (increment-2c interpreter capture)
     bool active_load = false;                              // .activeload = 1 (increment-2d force-load all classes)
+    bool openat_probe = false;                             // .openat = 1 (traceless openat probe; frida-parallel)
+    int openat_ms = 20000;                                 // .openat_ms (probe window)
 };
+
+// ---- openat traceless probe (frida-parallel; persist.kpmhook.unpack.openat=1) ---------------
+// Installs a KPM-TRACELESS inline hook on libc openat and logs DISTINCT file paths for a window.
+// Proves a Vector traceless hook SURVIVES + captures data on an app where frida and a Dobby hook
+// both get the process killed. Traceless-only: if kpm_inline_hooker fails (bridge down) we skip
+// rather than fall back to Dobby (which would trip the anti-tamper SIGKILL).
+std::mutex g_oa_mu;
+std::set<std::string> g_oa_seen;
+std::atomic<uint64_t> g_open_hits{0};
+std::atomic<uint64_t> g_openat_hits{0};
+thread_local bool g_oa_in = false;
+using OpenFn = int (*)(const char *, int, int);
+using OpenatFn = int (*)(int, const char *, int, int);
+OpenFn g_open_orig = nullptr;
+OpenatFn g_openat_orig = nullptr;
+
+void RecordPath(const char *tag, const char *path, int flags, int fd) {
+    if (g_oa_in || !path) return;
+    g_oa_in = true;  // re-entrancy guard: LOGI below may itself open() the logd socket once
+    std::string p(path);
+    bool fresh;
+    {
+        std::lock_guard<std::mutex> lk(g_oa_mu);
+        fresh = g_oa_seen.insert(p).second;
+    }
+    if (fresh) LOGI("[openat] ({}) {} flags=0x{:x} -> fd={}", tag, p.c_str(), flags, fd);
+    g_oa_in = false;
+}
+
+int OpenProbeHook(const char *path, int flags, int mode) {
+    int fd = g_open_orig ? g_open_orig(path, flags, mode) : -1;
+    g_open_hits.fetch_add(1, std::memory_order_relaxed);
+    RecordPath("open", path, flags, fd);
+    return fd;
+}
+
+int OpenatProbeHook(int dirfd, const char *path, int flags, int mode) {
+    int fd = g_openat_orig ? g_openat_orig(dirfd, path, flags, mode) : -1;
+    g_openat_hits.fetch_add(1, std::memory_order_relaxed);
+    RecordPath("openat", path, flags, fd);
+    return fd;
+}
+
+// Hook one libc symbol via the KPM clone path; store its backup(orig) via `store`. Returns the
+// hooked address (for later unhook) or nullptr on failure. Traceless-only -- no Dobby fallback.
+void *HookLibcFn(const char *sym, void *hook, void (*store)(void *)) {
+    void *addr = dlsym(RTLD_DEFAULT, sym);
+    if (!addr) {
+        LOGW("[openat] dlsym({}) failed", sym);
+        return nullptr;
+    }
+    void *backup = kpm_inline_hooker(addr, hook);
+    if (!backup) {
+        LOGW("[openat] kpm_inline_hooker({}) FAILED (bridge down / not gated) -- traceless-only", sym);
+        return nullptr;
+    }
+    store(backup);
+    LOGI("[openat] TRACELESS hook on {} @ {} (backup={})", sym, addr, backup);
+    return addr;
+}
+
+void RunOpenatProbe(int window_ms) {
+    // Hook BOTH open and openat: bionic routes many file opens through open()->__openat, which
+    // bypasses the public openat symbol -- so hooking openat alone under-captures. Per-fn hit
+    // counters disambiguate "the KPM reroute never fired" from "that symbol was just cold".
+    void *open_addr =
+        HookLibcFn("open", reinterpret_cast<void *>(&OpenProbeHook),
+                   [](void *b) { g_open_orig = reinterpret_cast<OpenFn>(b); });
+    void *openat_addr =
+        HookLibcFn("openat", reinterpret_cast<void *>(&OpenatProbeHook),
+                   [](void *b) { g_openat_orig = reinterpret_cast<OpenatFn>(b); });
+    if (!open_addr && !openat_addr) {
+        LOGW("[openat] no traceless hook installed -- abort probe");
+        return;
+    }
+    LOGI("[openat] logging distinct paths for {}ms ...", window_ms);
+    usleep((useconds_t)window_ms * 1000);
+    if (open_addr) kpm_inline_unhooker(open_addr);
+    if (openat_addr) kpm_inline_unhooker(openat_addr);
+    size_t n;
+    {
+        std::lock_guard<std::mutex> lk(g_oa_mu);
+        n = g_oa_seen.size();
+    }
+    LOGI("[openat] done: open fired {}x, openat fired {}x, {} distinct path(s); hooks removed",
+         g_open_hits.load(), g_openat_hits.load(), n);
+}
 
 bool PropIs(const char *name, char want) {
     char v[PROP_VALUE_MAX] = {0};
@@ -91,6 +195,16 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
         LOGW("[unpack] worker: AttachCurrentThread failed");
         return;
     }
+
+    // openat traceless probe (frida-parallel). If set, this is the worker's WHOLE job -- install
+    // the traceless openat hook, log distinct paths, exit. Kept isolated from the dump path so the
+    // survival/capture experiment is clean (no choke hook, no maps burst, no dexfind).
+    if (cfg.openat_probe) {
+        RunOpenatProbe(cfg.openat_ms);
+        vm->DetachCurrentThread();
+        return;
+    }
+
     void *art_thread = env->functions->reserved3;  // TODO(P1): the real art::Thread* (JNIEnv cookie / __get_tls)
 
     static CodeItemSink sink;
@@ -184,6 +298,8 @@ Config ReadConfigFromProps() {
     c.trigger = PropIs("persist.kpmhook.unpack.trigger", '1');
     c.interp = PropIs("persist.kpmhook.unpack.interp", '1');
     c.active_load = PropIs("persist.kpmhook.unpack.activeload", '1');
+    c.openat_probe = PropIs("persist.kpmhook.unpack.openat", '1');
+    c.openat_ms = PropInt("persist.kpmhook.unpack.openat_ms", 20000);
     return c;
 }
 
@@ -198,6 +314,9 @@ bool StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const cha
         LOGW("[unpack] StartIfEnabled: no JavaVM");
         return false;
     }
+    // Tell the KPM gate who we are BEFORE the worker calls kpm_inline_hooker (see the extern
+    // decl above). Without this the openat/traceless path fails the gate and latches.
+    kpm_hook_set_process_name(process_name);
     std::string out_dir = (app_data_dir && app_data_dir[0]) ? std::string(app_data_dir) + "/unpack"
                                                             : std::string("/data/local/tmp/unpack");
     LOGI("[unpack] enabled: tier={} stealth={} choke={} dir={} -> spawning worker",
