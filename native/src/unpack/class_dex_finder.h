@@ -34,6 +34,6 @@ class CodeItemSink;
 // shell (dpt) restores all CodeItems in place — recovering classes the app never reached. The dump
 // then captures the restored code.
 size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger,
-                             bool active_load);
+                             bool active_load, bool traceless, int pre_ms);
 
 }  // namespace vector::native::unpack

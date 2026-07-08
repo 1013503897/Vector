@@ -22,6 +22,11 @@
 #include "unpack/codeitem_sink.h"
 #include "unpack/dex_layout.h"  // CodeItemLength
 
+// KPM traceless backend (native/src/kpm) — for the traceless FindClass hook, so a RASP that scans
+// libart .text integrity (e.g. GCash's libloader) can't see a byte patch. See unpacker.cpp.
+extern "C" void *kpm_inline_hooker(void *target, void *hooker);
+extern "C" int kpm_inline_unhooker(void *func);
+
 namespace vector::native::unpack {
 
 namespace {
@@ -221,7 +226,7 @@ void *FindClassHook(void *thiz, void *self, const char *desc, size_t hash, void 
 }  // namespace
 
 size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger,
-                             bool active_load) {
+                             bool active_load, bool traceless, int pre_ms) {
     if (!sink) return 0;
     const auto &I = art::Get();
     if (!I.ok_for_dexfind()) {
@@ -263,19 +268,37 @@ size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, boo
     // Let the app load its own classes before enumerating — VisitClasses only sees LOADED classes,
     // so for a small/idle app an immediate enumeration catches mostly shell+framework. A short
     // pre-delay materially improves coverage; harmless for big apps that load fast. (Full coverage
-    // for cold methods needs active class-loading — increment-2c.)
-    int pre_ms = 6000;
+    // for cold methods needs active class-loading — increment-2c.) Configurable because a hardened
+    // app that self-kills/restarts its main process early (e.g. GCash ~8s) needs a SHORT delay so
+    // the enumerate+dump completes before the death (a whole-dex memfd shell has the dex mapped
+    // very early anyway).
     for (int w = 0; w < pre_ms; w += 200) usleep(200 * 1000);
 
-    if (DobbyHook(I.class_linker_find_class,
-                  reinterpret_cast<dobby_dummy_func_t>(&FindClassHook),
-                  reinterpret_cast<dobby_dummy_func_t *>(&g_orig_find_class)) != 0) {
-        LOGW("[unpack] dexfind: DobbyHook(FindClass) failed @ {}", I.class_linker_find_class);
+    bool hooked;
+    if (traceless) {
+        // KPM traceless clone hook: ClassLinker::FindClass bytes stay PRISTINE (the hook runs off a
+        // cloned page), so a RASP libart-integrity scan finds no patch. Needs the KPM process gate
+        // (set via kpm_hook_set_process_name in StartIfEnabled).
+        g_orig_find_class = reinterpret_cast<FindClassFn>(
+            kpm_inline_hooker(I.class_linker_find_class, reinterpret_cast<void *>(&FindClassHook)));
+        hooked = g_orig_find_class != nullptr;
+        if (!hooked)
+            LOGW("[unpack] dexfind: kpm_inline_hooker(FindClass) FAILED (bridge/gate?) @ {}",
+                 I.class_linker_find_class);
+    } else {
+        hooked = DobbyHook(I.class_linker_find_class,
+                           reinterpret_cast<dobby_dummy_func_t>(&FindClassHook),
+                           reinterpret_cast<dobby_dummy_func_t *>(&g_orig_find_class)) == 0;
+        if (!hooked)
+            LOGW("[unpack] dexfind: DobbyHook(FindClass) failed @ {}", I.class_linker_find_class);
+    }
+    if (!hooked) {
         g_defs = nullptr;
         g_I = nullptr;
         return 0;
     }
-    LOGI("[unpack] dexfind: FindClass hooked @ {}; self-triggering", I.class_linker_find_class);
+    LOGI("[unpack] dexfind: FindClass hooked @ {} ({}); self-triggering", I.class_linker_find_class,
+         traceless ? "traceless" : "dobby");
 
     // SELF-TRIGGER: call JNI FindClass from this worker -> routes through ClassLinker::FindClass
     // (our hook), which fires the enumeration. JNI FindClass transitions this attached thread to
@@ -295,7 +318,8 @@ size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, boo
     }
     // Leave a short grace so any in-flight hook invocation exits before we unpatch.
     usleep(20000);
-    DobbyDestroy(I.class_linker_find_class);
+    if (traceless) kpm_inline_unhooker(I.class_linker_find_class);
+    else DobbyDestroy(I.class_linker_find_class);
 
     if (!g_enum_done.load()) {
         LOGW("[unpack] dexfind: enumeration did not fire within {}ms", wait_ms);

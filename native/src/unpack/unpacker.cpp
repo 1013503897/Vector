@@ -56,6 +56,8 @@ struct Config {
     bool trigger = false;                                  // .trigger = 1 (increment-2 per-method restore)
     bool interp = false;                                   // .interp = 1 (increment-2c interpreter capture)
     bool active_load = false;                              // .activeload = 1 (increment-2d force-load all classes)
+    bool extout = false;                                   // .extout = 1 (write dumps to app EXTERNAL dir, pullable past SELinux MLS)
+    bool traceless = false;                                // .traceless = 1 (KPM clone hook for dexfind FindClass; RASP-safe)
     bool openat_probe = false;                             // .openat = 1 (traceless openat probe; frida-parallel)
     int openat_ms = 20000;                                 // .openat_ms (probe window)
     bool openat_dobby = false;                             // .openat_dobby = 1 (control arm: DobbyHook not KPM)
@@ -298,7 +300,9 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
                 trig = false;
             }
         }
-        size_t recovered = FindAndDumpClassDexes(&sink, env, 10000, trig, cfg.active_load);
+        int pre_ms = PropInt("persist.kpmhook.unpack.predelay_ms", 6000);
+        size_t recovered = FindAndDumpClassDexes(&sink, env, 10000, trig, cfg.active_load,
+                                                 cfg.traceless, pre_ms);
         LOGI("[unpack] dexfind: {} region(s) recovered (trigger={} activeload={})", recovered, trig,
              cfg.active_load);
     }
@@ -320,6 +324,8 @@ Config ReadConfigFromProps() {
     c.trigger = PropIs("persist.kpmhook.unpack.trigger", '1');
     c.interp = PropIs("persist.kpmhook.unpack.interp", '1');
     c.active_load = PropIs("persist.kpmhook.unpack.activeload", '1');
+    c.traceless = PropIs("persist.kpmhook.unpack.traceless", '1');
+    c.extout = PropIs("persist.kpmhook.unpack.extout", '1');
     c.openat_probe = PropIs("persist.kpmhook.unpack.openat", '1');
     c.openat_ms = PropInt("persist.kpmhook.unpack.openat_ms", 20000);
     c.openat_dobby = PropIs("persist.kpmhook.unpack.openat_dobby", '1');
@@ -340,8 +346,20 @@ bool StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const cha
     // Tell the KPM gate who we are BEFORE the worker calls kpm_inline_hooker (see the extern
     // decl above). Without this the openat/traceless path fails the gate and latches.
     kpm_hook_set_process_name(process_name);
-    std::string out_dir = (app_data_dir && app_data_dir[0]) ? std::string(app_data_dir) + "/unpack"
-                                                            : std::string("/data/local/tmp/unpack");
+    // Output dir. Default = the app's INTERNAL data dir (/data/user/0/<pkg>/unpack). On a hardened
+    // app with strict SELinux MLS categories (e.g. GCash), a locked-down su can't read those files
+    // (can't relabel/setenforce), so pulling the dump fails. extout=1 writes to the app's EXTERNAL
+    // dir instead (the app can write its own /storage/emulated/0/Android/data/<pkg>/files; root
+    // reads the same bytes at /data/media/0/... which is media_rw_data_file with NO app categories,
+    // so `adb pull` works). process_name == target here (exact-match gate), so it's the clean pkg.
+    std::string out_dir;
+    if (cfg.extout && process_name && process_name[0]) {
+        out_dir = std::string("/storage/emulated/0/Android/data/") + process_name + "/files/vunpack";
+    } else if (app_data_dir && app_data_dir[0]) {
+        out_dir = std::string(app_data_dir) + "/unpack";
+    } else {
+        out_dir = "/data/local/tmp/unpack";
+    }
     LOGI("[unpack] enabled: tier={} stealth={} choke={} dir={} -> spawning worker",
          static_cast<int>(cfg.tier), cfg.stealth, static_cast<int>(cfg.choke), out_dir.c_str());
     std::thread(WorkerMain, vm, cfg, std::move(out_dir)).detach();
