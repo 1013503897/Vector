@@ -22,6 +22,7 @@
 #include <thread>
 
 #include <common/logging.h>
+#include <dobby.h>  // control-arm backend for the openat probe (persist.kpmhook.unpack.openat_dobby=1)
 
 // Traceless KPM backend (defined in native/src/kpm, declared in core/native_api.h). Forward-
 // declared here so the openat probe can call kpm_inline_hooker DIRECTLY -- traceless-ONLY, with
@@ -57,6 +58,7 @@ struct Config {
     bool active_load = false;                              // .activeload = 1 (increment-2d force-load all classes)
     bool openat_probe = false;                             // .openat = 1 (traceless openat probe; frida-parallel)
     int openat_ms = 20000;                                 // .openat_ms (probe window)
+    bool openat_dobby = false;                             // .openat_dobby = 1 (control arm: DobbyHook not KPM)
 };
 
 // ---- openat traceless probe (frida-parallel; persist.kpmhook.unpack.openat=1) ---------------
@@ -101,49 +103,69 @@ int OpenatProbeHook(int dirfd, const char *path, int flags, int mode) {
     return fd;
 }
 
-// Hook one libc symbol via the KPM clone path; store its backup(orig) via `store`. Returns the
-// hooked address (for later unhook) or nullptr on failure. Traceless-only -- no Dobby fallback.
-void *HookLibcFn(const char *sym, void *hook, void (*store)(void *)) {
+// Hook one libc symbol via the chosen backend; store its backup(orig) via `store`. Returns the
+// hooked address (for later unhook) or nullptr on failure. use_dobby=false -> KPM traceless (no
+// Dobby fallback); use_dobby=true -> DobbyHook inline patch (the frida-parallel A/B CONTROL arm:
+// an inline patch is what an anti-tamper code-integrity scan is meant to catch).
+void *HookLibcFn(const char *sym, void *hook, void (*store)(void *), bool use_dobby) {
     void *addr = dlsym(RTLD_DEFAULT, sym);
     if (!addr) {
         LOGW("[openat] dlsym({}) failed", sym);
         return nullptr;
     }
-    void *backup = kpm_inline_hooker(addr, hook);
-    if (!backup) {
-        LOGW("[openat] kpm_inline_hooker({}) FAILED (bridge down / not gated) -- traceless-only", sym);
-        return nullptr;
+    void *backup = nullptr;
+    if (use_dobby) {
+        if (DobbyHook(addr, reinterpret_cast<dobby_dummy_func_t>(hook),
+                      reinterpret_cast<dobby_dummy_func_t *>(&backup)) != 0) {
+            LOGW("[openat] DobbyHook({}) failed", sym);
+            return nullptr;
+        }
+    } else {
+        backup = kpm_inline_hooker(addr, hook);
+        if (!backup) {
+            LOGW("[openat] kpm_inline_hooker({}) FAILED (bridge down / not gated) -- traceless-only", sym);
+            return nullptr;
+        }
     }
     store(backup);
-    LOGI("[openat] TRACELESS hook on {} @ {} (backup={})", sym, addr, backup);
+    LOGI("[openat] {} hook on {} @ {} (backup={})", use_dobby ? "DOBBY" : "TRACELESS", sym, addr, backup);
     return addr;
 }
 
-void RunOpenatProbe(int window_ms) {
+void RunOpenatProbe(int window_ms, bool use_dobby) {
+    LOGI("[openat] backend = {}", use_dobby ? "DOBBY inline-patch (control arm)" : "KPM-TRACELESS");
     // Hook BOTH open and openat: bionic routes many file opens through open()->__openat, which
     // bypasses the public openat symbol -- so hooking openat alone under-captures. Per-fn hit
-    // counters disambiguate "the KPM reroute never fired" from "that symbol was just cold".
+    // counters disambiguate "the reroute/patch never fired" from "that symbol was just cold".
     void *open_addr =
         HookLibcFn("open", reinterpret_cast<void *>(&OpenProbeHook),
-                   [](void *b) { g_open_orig = reinterpret_cast<OpenFn>(b); });
+                   [](void *b) { g_open_orig = reinterpret_cast<OpenFn>(b); }, use_dobby);
     void *openat_addr =
         HookLibcFn("openat", reinterpret_cast<void *>(&OpenatProbeHook),
-                   [](void *b) { g_openat_orig = reinterpret_cast<OpenatFn>(b); });
+                   [](void *b) { g_openat_orig = reinterpret_cast<OpenatFn>(b); }, use_dobby);
     if (!open_addr && !openat_addr) {
-        LOGW("[openat] no traceless hook installed -- abort probe");
+        LOGW("[openat] no hook installed -- abort probe");
         return;
     }
     LOGI("[openat] logging distinct paths for {}ms ...", window_ms);
     usleep((useconds_t)window_ms * 1000);
-    if (open_addr) kpm_inline_unhooker(open_addr);
-    if (openat_addr) kpm_inline_unhooker(openat_addr);
+    if (use_dobby) {
+        // Do NOT DobbyDestroy: open is hot (100s of calls/window); unpatching while an app
+        // thread is inside the trampoline spins/hangs the worker (same hazard as the interp
+        // Execute hook). The control arm only needs the survival signal, so leave it patched.
+        LOGI("[openat] (dobby control arm: hooks left installed -- hot-fn destroy would hang)");
+    } else {
+        if (open_addr) kpm_inline_unhooker(open_addr);
+        if (openat_addr) kpm_inline_unhooker(openat_addr);
+    }
     size_t n;
     {
         std::lock_guard<std::mutex> lk(g_oa_mu);
         n = g_oa_seen.size();
     }
-    LOGI("[openat] done: open fired {}x, openat fired {}x, {} distinct path(s); hooks removed",
-         g_open_hits.load(), g_openat_hits.load(), n);
+    LOGI("[openat] done: open fired {}x, openat fired {}x, {} distinct path(s); {}",
+         g_open_hits.load(), g_openat_hits.load(), n,
+         use_dobby ? "dobby hooks LEFT installed" : "traceless hooks removed");
 }
 
 bool PropIs(const char *name, char want) {
@@ -200,7 +222,7 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
     // the traceless openat hook, log distinct paths, exit. Kept isolated from the dump path so the
     // survival/capture experiment is clean (no choke hook, no maps burst, no dexfind).
     if (cfg.openat_probe) {
-        RunOpenatProbe(cfg.openat_ms);
+        RunOpenatProbe(cfg.openat_ms, cfg.openat_dobby);
         vm->DetachCurrentThread();
         return;
     }
@@ -300,6 +322,7 @@ Config ReadConfigFromProps() {
     c.active_load = PropIs("persist.kpmhook.unpack.activeload", '1');
     c.openat_probe = PropIs("persist.kpmhook.unpack.openat", '1');
     c.openat_ms = PropInt("persist.kpmhook.unpack.openat_ms", 20000);
+    c.openat_dobby = PropIs("persist.kpmhook.unpack.openat_dobby", '1');
     return c;
 }
 
