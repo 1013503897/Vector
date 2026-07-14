@@ -271,6 +271,34 @@ static uint64_t next_rgn_base_locked(uint64_t base, uint64_t cap)
     return lo;
 }
 
+/* End VA of the contiguous READABLE mapping containing `addr` (extends across adjacent
+ * readable VMAs), or 0 if addr is not in a readable mapping. Used to stop region
+ * expansion before a non-readable page: hardened/packed libs (e.g. GCash's libAPSE)
+ * split their .text with --xp/---p sub-ranges, and dbi_recompile reading into one
+ * SIGSEGVs (SEGV_ACCERR) -> a flaky hook-install crash. Reads /proc/self/maps, which is
+ * sleepable install-context only (never the fault path). maps are address-sorted. */
+static uint64_t readable_extent_end(uint64_t addr)
+{
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return 0;
+    char line[256];
+    uint64_t end = 0;
+    while (fgets(line, sizeof line, f)) {
+        uint64_t lo, hi;
+        char perms[8];
+        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
+        if (end == 0) {
+            if (addr >= lo && addr < hi && perms[0] == 'r') end = hi; /* the containing readable VMA */
+        } else if (lo == end && perms[0] == 'r') {
+            end = hi;         /* extend across a contiguous readable VMA */
+        } else if (lo >= end) {
+            break;            /* gap or non-readable neighbor -> stop */
+        }
+    }
+    fclose(f);
+    return end;
+}
+
 /* Build a clean-bounded multi-page region clone covering `target`. R_lo = target's
  * page; expand R_hi to the next clean boundary (capped at MAX_RGN_PAGES and at any
  * existing region). Returns a populated entry, or NULL -> caller falls back to Dobby. */
@@ -280,6 +308,12 @@ static struct rgn *make_rgn_locked(uint64_t target)
     uint64_t cap = base + (uint64_t)MAX_RGN_PAGES * PAGE_SZ;
     uint64_t collide = next_rgn_base_locked(base, cap);
     if (collide) cap = collide; /* don't overlap an existing region */
+    /* never expand into a non-readable page: dbi_recompile reads [base,end) to build the
+     * clone, and packed libs (libAPSE) split .text with non-readable sub-ranges -> a read
+     * there SIGSEGVs (the flaky getColorInfo install crash). Cap at base's readable extent. */
+    uint64_t rd_end = readable_extent_end(base);
+    if (!rd_end) return 0;      /* base itself not readable -> Dobby (can't clone) */
+    if (rd_end < cap) cap = rd_end;
     uint64_t end = base + PAGE_SZ;
     while (end < cap && !clean_boundary(end)) end += PAGE_SZ;
     if (!clean_boundary(end)) return 0; /* no clean boundary in budget -> Dobby */
