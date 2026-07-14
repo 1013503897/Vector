@@ -271,24 +271,29 @@ static uint64_t next_rgn_base_locked(uint64_t base, uint64_t cap)
     return lo;
 }
 
-/* End VA of the contiguous READABLE mapping containing `addr` (extends across adjacent
- * readable VMAs), or 0 if addr is not in a readable mapping. Used to stop region
- * expansion before a non-readable page: hardened/packed libs (e.g. GCash's libAPSE)
- * split their .text with --xp/---p sub-ranges, and dbi_recompile reading into one
- * SIGSEGVs (SEGV_ACCERR) -> a flaky hook-install crash. Reads /proc/self/maps, which is
- * sleepable install-context only (never the fault path). maps are address-sorted. */
-static uint64_t readable_extent_end(uint64_t addr)
+/* Bounds of the contiguous READABLE mapping containing `addr` (extends across adjacent
+ * readable VMAs): returns the extent END, sets *out_start to the extent START, or 0 if
+ * addr is not in a readable mapping. Two uses, both against hardened/packed libs (e.g.
+ * GCash's libAPSE) that split their .text with non-readable --xp/---p sub-ranges:
+ *   1. cap region expansion at [.,end) so dbi_recompile's [base,end) read stays readable;
+ *   2. bound dbi's LDR-literal-pool reads to [start,end) so a bytecode word MISDECODED as
+ *      an LDR-literal (obfuscated VM) resolving OUTSIDE the readable extent is SKIPPED, not
+ *      read -- that out-of-extent read (e.g. base-486KB, below libAPSE) SIGSEGVs otherwise.
+ * Reads /proc/self/maps (sleepable install context only, never the fault path); maps are
+ * address-sorted. */
+static uint64_t readable_extent(uint64_t addr, uint64_t *out_start)
 {
+    if (out_start) *out_start = 0;
     FILE *f = fopen("/proc/self/maps", "re");
     if (!f) return 0;
     char line[256];
-    uint64_t end = 0;
+    uint64_t start = 0, end = 0;
     while (fgets(line, sizeof line, f)) {
         uint64_t lo, hi;
         char perms[8];
         if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perms) != 3) continue;
         if (end == 0) {
-            if (addr >= lo && addr < hi && perms[0] == 'r') end = hi; /* the containing readable VMA */
+            if (addr >= lo && addr < hi && perms[0] == 'r') { start = lo; end = hi; } /* containing readable VMA */
         } else if (lo == end && perms[0] == 'r') {
             end = hi;         /* extend across a contiguous readable VMA */
         } else if (lo >= end) {
@@ -296,6 +301,7 @@ static uint64_t readable_extent_end(uint64_t addr)
         }
     }
     fclose(f);
+    if (out_start) *out_start = start;
     return end;
 }
 
@@ -310,8 +316,10 @@ static struct rgn *make_rgn_locked(uint64_t target)
     if (collide) cap = collide; /* don't overlap an existing region */
     /* never expand into a non-readable page: dbi_recompile reads [base,end) to build the
      * clone, and packed libs (libAPSE) split .text with non-readable sub-ranges -> a read
-     * there SIGSEGVs (the flaky getColorInfo install crash). Cap at base's readable extent. */
-    uint64_t rd_end = readable_extent_end(base);
+     * there SIGSEGVs (the flaky getColorInfo install crash). Cap at base's readable extent
+     * and reuse the same [rd_start,rd_end) to bound dbi's literal-pool reads below. */
+    uint64_t rd_start = 0;
+    uint64_t rd_end = readable_extent(base, &rd_start);
     if (!rd_end) return 0;      /* base itself not readable -> Dobby (can't clone) */
     if (rd_end < cap) cap = rd_end;
     uint64_t end = base + PAGE_SZ;
@@ -324,9 +332,11 @@ static struct rgn *make_rgn_locked(uint64_t target)
     uint32_t *scratch = malloc((size_t)RGN_CLONE_CAP * 4);
     if (!offmap || !scratch) { free(offmap); free(scratch); return 0; }
 
-    /* bound LDR-literal pool reads to +/-8 MiB around the region (mapped segments) */
+    /* bound LDR-literal pool reads to base's READABLE extent (not a blind +/-8 MiB): an
+     * obfuscated-VM word misdecoded as an LDR-literal that resolves outside [rd_start,rd_end)
+     * is skipped instead of dereferenced (that out-of-extent read SIGSEGVs on packed libs). */
     int csz = dbi_recompile_range(base, (const uint32_t *)(uintptr_t)base, n, scratch, RGN_CLONE_CAP,
-                                  offmap, n, (uintptr_t)(base - 0x800000), (uintptr_t)(end + 0x800000));
+                                  offmap, n, (uintptr_t)rd_start, (uintptr_t)rd_end);
     if (csz < 0) { free(offmap); free(scratch); return 0; }
 
     size_t sz = ((size_t)csz * 4 + (PAGE_SZ - 1)) & ~(PAGE_SZ - 1);
