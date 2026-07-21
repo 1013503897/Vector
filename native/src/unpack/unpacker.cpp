@@ -10,10 +10,21 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <link.h>
+#include <sys/stat.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 
+#include <unwind.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <errno.h>
+#include <sys/syscall.h>
+
 #include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -23,12 +34,17 @@
 
 #include <common/logging.h>
 #include <dobby.h>  // control-arm backend for the openat probe (persist.kpmhook.unpack.openat_dobby=1)
+#include <elf/elf_image.h>  // resolve libc-internal symbols (__openat) from .symtab/.gnu_debugdata
 
 // Traceless KPM backend (defined in native/src/kpm, declared in core/native_api.h). Forward-
 // declared here so the openat probe can call kpm_inline_hooker DIRECTLY -- traceless-ONLY, with
 // NO Dobby fallback (a Dobby/inline patch gets the process SIGKILL'd by anti-tamper guards).
 extern "C" void *kpm_inline_hooker(void *target, void *hooker);
 extern "C" int kpm_inline_unhooker(void *func);
+// mm-gated maps-hide: filters the page/VMA containing `addr` out of in-process /proc/self/{maps,
+// smaps} reads (kernel-side, so it works no matter how the target reads maps). Used to hide the
+// injected module .so + trampolines from GCash's libloader maps-scan RASP.
+extern "C" int kpm_hide_region(void *addr);
 // Identify this process to the KPM's proc_is_target() gate (which compares against
 // persist.kpmhook.target). Vector's normal path sets this in module.cpp, but only AFTER
 // StartIfEnabled and only for in-scope apps -- so the traceless worker must set it itself
@@ -61,6 +77,8 @@ struct Config {
     bool openat_probe = false;                             // .openat = 1 (traceless openat probe; frida-parallel)
     int openat_ms = 20000;                                 // .openat_ms (probe window)
     bool openat_dobby = false;                             // .openat_dobby = 1 (control arm: DobbyHook not KPM)
+    bool gcash_fix = false;                                // .gcashfix = 1 (KPM-traceless neutralize GCash Ant-APSE libloader RASP)
+    unsigned long gcash_off = 0x1d0bb0;                    // .gcashoff (libloader detect-fn offset; RE: FUN_002d0bb0)
 };
 
 // ---- openat traceless probe (frida-parallel; persist.kpmhook.unpack.openat=1) ---------------
@@ -212,7 +230,407 @@ ChokePoint ParseChoke() {
     return ChokePoint::kArtMethodGetCodeItem;
 }
 
+// ---- GCash Ant-APSE libloader RASP neutralize (persist.kpmhook.unpack.gcashfix=1) -----------
+// RE (subagent): libloader = Ant/Alipay APSE packer; FUN_002d0bb0 @ off 0x1d0bb0 decrypts the
+// string "/proc/self/maps", reads it, strcasecmp-scans each line vs a blocklist, returns w20=1 on
+// a hit (an injected .so) -> falls through to _exit. libloader SELF-CRCs its .text, so a
+// Dobby/inline patch is detected (each extra hook killed GCash faster). The KPM whole-page clone
+// hook leaves the ORIGINAL .text byte-identical (self-CRC reads pass) while rerouting EXECUTION to
+// the clone -> traceless-hook the detect fn to just return 0 (clean verdict), so libloader never
+// self-exits. Offset is prop-overridable (persist.kpmhook.unpack.gcashoff) for iteration.
+uintptr_t FindLibBase(const char *name) {
+    FILE *f = fopen("/proc/self/maps", "re");
+    if (!f) return 0;
+    char line[600];
+    uintptr_t base = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strstr(line, name)) {
+            uintptr_t s = strtoul(line, nullptr, 16);
+            if (s && (base == 0 || s < base)) base = s;
+        }
+    }
+    fclose(f);
+    return base;
+}
+
+// A maps line is an injected/anomalous region libloader's RASP would flag: a module .so under
+// /data/adb/modules (zygisk_vector / zygisksu / phoenix / riru), or a lone rwxp anon page (an
+// LSPlant trampoline / KPM clone). We do NOT hide libloader itself or app/system libs.
+bool MapsLineIsInjected(const char *line) {
+    if (strstr(line, "/data/adb/") || strstr(line, "zygisk") || strstr(line, "riru") ||
+        strstr(line, "libphoenix") || strstr(line, "/vector"))
+        return true;
+    // lone rwxp anon (no pathname): perms field "rwxp" and the line has no '/'
+    const char *sp = strchr(line, ' ');
+    if (sp && strncmp(sp + 1, "rwxp", 4) == 0 && !strchr(line, '/') && !strstr(line, "[anon:"))
+        return true;
+    return false;
+}
+
+// ---- next-layer diagnosis + neutralize: the SIGKILL that fires after maps-scan is defeated ----
+// KPM-traceless-hook libc kill/tgkill: block a lethal self-directed signal (the RASP's kill path)
+// and unwind-log the caller so we can identify + locate the NEXT detection. Traceless (KPM clone)
+// so libloader's .text/libc self-CRC stays clean.
+struct GcBt { void **f; int n; int max; };
+static _Unwind_Reason_Code GcTraceCb(struct _Unwind_Context *c, void *a) {
+    GcBt *s = reinterpret_cast<GcBt *>(a);
+    void *pc = reinterpret_cast<void *>(_Unwind_GetIP(c));
+    if (pc && s->n < s->max) s->f[s->n++] = pc;
+    return s->n >= s->max ? _URC_END_OF_STACK : _URC_NO_REASON;
+}
+void GcLogCaller(const char *what, int arg) {
+    void *fr[8];
+    GcBt st{fr, 0, 8};
+    _Unwind_Backtrace(GcTraceCb, &st);
+    LOGW("[gcashfix] BLOCK {}({}) — caller chain:", what, arg);
+    for (int i = 0; i < st.n; i++) {
+        Dl_info di;
+        if (dladdr(fr[i], &di) && di.dli_fname) {
+            const char *b = strrchr(di.dli_fname, '/');
+            b = b ? b + 1 : di.dli_fname;
+            LOGW("[gcashfix]   #{} {}+0x{:x}", i, b,
+                 (unsigned long)fr[i] - (unsigned long)di.dli_fbase);
+        }
+    }
+}
+// dl_iterate_phdr module-enumeration filter: libloader's SECOND way to find injected modules
+// (walks the linker's in-memory link_map, NOT /proc/self/maps -> maps-hide can't touch it). Hook
+// it (KPM-traceless) and drop injected modules from the callback so the scan sees a clean set.
+struct GcDlWrap { int (*cb)(struct dl_phdr_info *, size_t, void *); void *data; };
+int GcDlFilterCb(struct dl_phdr_info *info, size_t size, void *data) {
+    GcDlWrap *w = reinterpret_cast<GcDlWrap *>(data);
+    const char *n = info->dlpi_name;
+    if (n && (strstr(n, "zygisk") || strstr(n, "/data/adb") || strstr(n, "libphoenix") ||
+              strstr(n, "riru") || strstr(n, "/vector")))
+        return 0;  // skip injected module (don't surface it to the real callback)
+    return w->cb(info, size, w->data);
+}
+int (*g_gc_orig_dlip)(int (*)(struct dl_phdr_info *, size_t, void *), void *) = nullptr;
+extern "C" int GcashDlIterateHook(int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
+    if (!g_gc_orig_dlip) return -1;
+    GcDlWrap w{cb, data};
+    return g_gc_orig_dlip(GcDlFilterCb, &w);
+}
+
+void GcDumpJavaStack(const char *why);  // fwd (defined below, near the kill hooks)
+// Shamiko-style root-file hiding: GCash's Java root detection (File.exists/canRead) resolves to
+// libc faccessat/fstatat. Return ENOENT for known root paths so the scan finds a clean device.
+static bool GcIsRootPath(const char *p) {
+    if (!p) return false;
+    static const char *bl[] = {
+        "/debug_ramdisk", "/data/adb", "/sbin/su", "/system/bin/su", "/system/xbin/su",
+        "/vendor/bin/su", "/product/bin/su", "/su/bin", "vsync_svc_hlpr", "/dev/su",
+        "/data/local/tmp/su", "supersu", "SuperSU", "/system/app/Superuser", "busybox",
+        "magisk", ".magisk", "riru", "zygisk", "lsposed", "xposed", "apatch", "/data/adb/ap",
+        "kernelsu", "/system/xbin/busybox", "/cache/su", nullptr};
+    for (int i = 0; bl[i]; i++)
+        if (strstr(p, bl[i])) return true;
+    return false;
+}
+int (*g_gc_orig_faccessat)(int, const char *, int, int) = nullptr;
+int (*g_gc_orig_fstatat)(int, const char *, void *, int) = nullptr;
+int (*g_gc_orig_openat)(int, const char *, int, int) = nullptr;
+// A mount/proc line that would reveal root (module mounts, overlay, /data/adb, magisk, su path).
+static bool GcMountLineDirty(const char *line) {
+    if (strstr(line, "/data/adb") || strstr(line, "magisk") || strstr(line, "overlay") ||
+        strstr(line, "meta-overlayfs") || strstr(line, "vsync_svc_hlpr") || strstr(line, "riru") ||
+        strstr(line, "KSU") || strstr(line, "zygisk") || strstr(line, "/debug_ramdisk") ||
+        strstr(line, "libphoenix") || strstr(line, "/vector"))
+        return true;
+    // maps: a lone rwxp anon region (KPM clone / LSPlant trampoline) -- exec+writable, no path.
+    const char *sp = strchr(line, ' ');
+    if (sp && strncmp(sp + 1, "rwxp", 4) == 0 && !strchr(line, '/') && !strstr(line, "[anon:"))
+        return true;
+    return false;
+}
+// Hook __openat: for /proc/{mounts,self/mountinfo,self/mounts}, return a memfd holding the file
+// with root-revealing lines filtered out. Java File reads (open()->__openat) then see a clean view.
+extern "C" int GcashOpenatHook(int dirfd, const char *path, int flags, int mode) {
+    if (path && (strstr(path, "/proc/") || strstr(path, "/sys/")) &&
+        !strstr(path, "/proc/self/task") && !strstr(path, "cgroup"))
+        LOGI("[gcashfix] OPEN {}", path);  // diagnostic: what /proc,/sys does GCash read?
+    // NOTE: /proc/self/maps is NOT sanitized here -- the kernel maps-hide (kpm_hide_region) filters
+    // its content in-kernel, so readlink(/proc/self/fd/N) still shows the real path (a memfd
+    // substitution would be detectable via /proc/self/fd, which RASPs scan). Only /proc/mounts
+    // (rarely readlink'd) goes through the memfd path.
+    if (path && g_gc_orig_openat &&
+        (strstr(path, "/proc/mounts") || strstr(path, "/proc/self/mountinfo") ||
+         strstr(path, "/proc/self/mounts") || strstr(path, "/proc/1/mounts"))) {
+        int real = g_gc_orig_openat(dirfd, path, O_RDONLY | O_CLOEXEC, 0);
+        if (real >= 0) {
+            std::string clean;
+            char buf[8192];
+            std::string cur;
+            ssize_t n;
+            while ((n = read(real, buf, sizeof(buf))) > 0) cur.append(buf, n);
+            close(real);
+            size_t start = 0;
+            while (start < cur.size()) {
+                size_t nl = cur.find('\n', start);
+                if (nl == std::string::npos) nl = cur.size();
+                std::string line = cur.substr(start, nl - start);
+                if (!GcMountLineDirty(line.c_str())) { clean += line; clean += '\n'; }
+                start = nl + 1;
+            }
+            int mfd = syscall(__NR_memfd_create, "m", 0);
+            if (mfd >= 0) {
+                write(mfd, clean.data(), clean.size());
+                lseek(mfd, 0, SEEK_SET);
+                return mfd;
+            }
+        }
+    }
+    return g_gc_orig_openat ? g_gc_orig_openat(dirfd, path, flags, mode) : -1;
+}
+std::atomic<int> g_gc_stack_dumps{0};
+extern "C" int GcashFaccessatHook(int dirfd, const char *path, int mode, int flags) {
+    if (GcIsRootPath(path)) {
+        LOGI("[gcashfix] HIDE access({})", path ? path : "?");
+        if (g_gc_stack_dumps.fetch_add(1) < 2) GcDumpJavaStack("root-file scan (access)");
+        errno = ENOENT;
+        return -1;
+    }
+    return g_gc_orig_faccessat ? g_gc_orig_faccessat(dirfd, path, mode, flags) : -1;
+}
+extern "C" int GcashFstatatHook(int dirfd, const char *path, void *buf, int flags) {
+    if (GcIsRootPath(path)) { LOGI("[gcashfix] HIDE stat({})", path ? path : "?"); errno = ENOENT; return -1; }
+    return g_gc_orig_fstatat ? g_gc_orig_fstatat(dirfd, path, buf, flags) : -1;
+}
+
+// Dump the CURRENT thread's Java stack (the thread that called Process.killProcess / decided to
+// finish) -> reveals which GCash class/method drives the close. Uses vm->GetEnv (the calling thread
+// is a live app Java thread, already attached). PROOF, not inference.
+JavaVM *g_gc_vm = nullptr;
+void GcDumpJavaStack(const char *why) {
+    if (!g_gc_vm) return;
+    JNIEnv *env = nullptr;
+    if (g_gc_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK || !env) return;
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    jclass thrCls = env->FindClass("java/lang/Thread");
+    jclass steCls = env->FindClass("java/lang/StackTraceElement");
+    if (!thrCls || !steCls) { env->ExceptionClear(); return; }
+    jmethodID curThr = env->GetStaticMethodID(thrCls, "currentThread", "()Ljava/lang/Thread;");
+    jmethodID getStk = env->GetMethodID(thrCls, "getStackTrace", "()[Ljava/lang/StackTraceElement;");
+    jmethodID toStr = env->GetMethodID(steCls, "toString", "()Ljava/lang/String;");
+    if (!curThr || !getStk || !toStr) { env->ExceptionClear(); return; }
+    jobject thr = env->CallStaticObjectMethod(thrCls, curThr);
+    jobjectArray stk = reinterpret_cast<jobjectArray>(env->CallObjectMethod(thr, getStk));
+    if (!stk) { env->ExceptionClear(); return; }
+    jsize n = env->GetArrayLength(stk);
+    LOGW("[gcashfix] JAVA STACK at {} ({} frames):", why, (int)n);
+    for (jsize i = 0; i < n && i < 30; i++) {
+        jobject ste = env->GetObjectArrayElement(stk, i);
+        jstring s = reinterpret_cast<jstring>(env->CallObjectMethod(ste, toStr));
+        if (s) {
+            const char *cs = env->GetStringUTFChars(s, nullptr);
+            LOGW("[gcashfix]   #{} {}", (int)i, cs ? cs : "?");
+            if (cs) env->ReleaseStringUTFChars(s, cs);
+        }
+        env->DeleteLocalRef(ste);
+        if (s) env->DeleteLocalRef(s);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+}
+
+static bool GcLethal(int sig) { return sig == 9 || sig == 6 || sig == 4 || sig == 11; }
+int (*g_gc_orig_kill)(pid_t, int) = nullptr;
+int (*g_gc_orig_tgkill)(int, int, int) = nullptr;
+// BLOCK the self-directed lethal signal. The RE-confirmed kill is Java `Process.killProcess(self)`
+// -> Process.sendSignal -> libc kill(pid,9); no-op'ing it just returns to GCash's Java code (void,
+// no return check) so the app keeps running -- unlike libloader's NATIVE self-kill (which we avoid
+// triggering by hiding the injection via maps-hide + dl_iterate). Return 0 = "signal sent OK".
+extern "C" int GcashKillHook(pid_t pid, int sig) {
+    if (GcLethal(sig) && (pid == getpid() || pid <= 0)) {
+        GcLogCaller("kill", sig);
+        GcDumpJavaStack("kill(self)");
+        return 0;
+    }
+    return g_gc_orig_kill ? g_gc_orig_kill(pid, sig) : -1;
+}
+extern "C" int GcashTgkillHook(int tgid, int tid, int sig) {
+    if (GcLethal(sig) && (tgid == getpid() || tgid <= 0)) {
+        GcLogCaller("tgkill", sig);
+        GcDumpJavaStack("tgkill(self)");
+        return 0;
+    }
+    return g_gc_orig_tgkill ? g_gc_orig_tgkill(tgid, tid, sig) : -1;
+}
+
+// seccomp: kernel BPF filter blocking the RASP's inline-svc self-kill (exit_group + lethal
+// kill/tgkill). Syscall-level -> catches the inline svc that libc-function hooks miss; modifies NO
+// .text -> libloader's self-CRC stays clean (unlike svc-instrument). TSYNC applies it to ALL
+// threads (incl. the RASP detection threads). exit(93) stays allowed so a detection THREAD can
+// exit while the PROCESS survives.
+void InstallGcashSeccomp() {
+    struct sock_filter f[] = {
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 94, 11, 0),  // exit_group -> BLOCK(13)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 129, 2, 0),  // kill       -> CHK_KILL(5)
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 131, 5, 0),  // tgkill     -> CHK_TG(9)
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[1])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9, 6, 0),  // SIGKILL -> BLOCK
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6, 5, 0),  // SIGABRT -> BLOCK
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, args[2])),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9, 2, 0),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6, 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EPERM & SECCOMP_RET_DATA)),
+    };
+    struct sock_fprog prog = {(unsigned short)(sizeof(f) / sizeof(f[0])), f};
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);  // required for an unprivileged filter
+    long r = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (r == 0)
+        LOGI("[gcashfix] seccomp installed (TSYNC all-threads): block exit_group + lethal kill/tgkill");
+    else
+        LOGW("[gcashfix] seccomp(TSYNC) failed: {}", strerror(errno));
+}
+
+// Hide every injected/anomalous maps region so libloader's /proc/self/maps blocklist scan finds
+// nothing. Kernel mm-gated (kpm_hide_region) -> defeats the scan no matter how it reads maps, and
+// leaves all code byte-identical (self-CRC clean). Repeated a few rounds: new trampolines/clones
+// and the module .so may map at slightly different times during startup.
+void RunGcashNeutralize(JavaVM *vm, unsigned long off) {
+    (void)off;
+    g_gc_vm = vm;  // for GcDumpJavaStack (proof of what code drives the close)
+    // Install the hooks ASAP -- root/tamper detection fires very early (OneApp exits ~10s). Only a
+    // brief settle so our injected .so is mapped (it is, at inject time). (Was a GCash-specific
+    // 8s wait for libloader.so, which starved non-GCash targets of their hooks before they ran.)
+    usleep(150 * 1000);
+
+    // Prevent DETECTION (not block the response -- blocking exit/kill just crashes libloader, which
+    // isn't built to survive its own self-kill failing). Hide the injected modules from BOTH
+    // enumeration methods: /proc/self/maps (maps-hide loop below) AND dl_iterate_phdr (link_map).
+    // Resolve libc symbols by ADDRESS (&fn); dlsym(RTLD_DEFAULT,...) returned NULL in the injected
+    // .so's namespace. Hide the injected modules from dl_iterate_phdr (link_map enumeration).
+    void *dl = reinterpret_cast<void *>(&dl_iterate_phdr);
+    {
+        void *bk = kpm_inline_hooker(dl, reinterpret_cast<void *>(&GcashDlIterateHook));
+        if (bk) {
+            g_gc_orig_dlip = reinterpret_cast<int (*)(int (*)(struct dl_phdr_info *, size_t, void *),
+                                                      void *)>(bk);
+            LOGI("[gcashfix] traceless-hooked dl_iterate_phdr @ {} (hide injected modules)", dl);
+        } else {
+            LOGW("[gcashfix] kpm_inline_hooker(dl_iterate_phdr) FAILED");
+        }
+    }
+    // kill + tgkill BLOCK hooks: stop GCash's Java `Process.killProcess(self)` root-detection
+    // response. Resolve by address (&fn); tgkill has no libc wrapper decl on bionic, resolve via
+    // dlsym as a fallback.
+    void *kf = reinterpret_cast<void *>(&kill);
+    {
+        void *bk = kpm_inline_hooker(kf, reinterpret_cast<void *>(&GcashKillHook));
+        if (bk) { g_gc_orig_kill = reinterpret_cast<int (*)(pid_t, int)>(bk);
+                  LOGI("[gcashfix] traceless-hooked kill @ {} (BLOCK self)", kf); }
+        else LOGW("[gcashfix] kpm_inline_hooker(kill) FAILED");
+    }
+    void *tf = dlsym(RTLD_DEFAULT, "tgkill");
+    if (!tf) {
+        vector::native::ElfImage libc("libc.so");
+        if (libc.IsValid()) tf = const_cast<void *>(libc.getSymbAddress<const void *>("tgkill"));
+    }
+    if (tf) {
+        void *bk = kpm_inline_hooker(tf, reinterpret_cast<void *>(&GcashTgkillHook));
+        if (bk) { g_gc_orig_tgkill = reinterpret_cast<int (*)(int, int, int)>(bk);
+                  LOGI("[gcashfix] traceless-hooked tgkill @ {} (BLOCK self)", tf); }
+        else LOGW("[gcashfix] kpm_inline_hooker(tgkill) FAILED");
+    } else {
+        LOGW("[gcashfix] tgkill symbol not found");
+    }
+    // Shamiko-style root-file hiding: hook faccessat + fstatat -> ENOENT for root paths, so GCash's
+    // Java File.exists()/canRead() root detection sees a clean device (it can't decide to close).
+    void *af = reinterpret_cast<void *>(&faccessat);
+    if (af) {
+        void *bk = kpm_inline_hooker(af, reinterpret_cast<void *>(&GcashFaccessatHook));
+        if (bk) { g_gc_orig_faccessat = reinterpret_cast<int (*)(int, const char *, int, int)>(bk);
+                  LOGI("[gcashfix] traceless-hooked faccessat @ {} (hide root paths)", af); }
+        else LOGW("[gcashfix] kpm_inline_hooker(faccessat) FAILED");
+    }
+    void *sf = reinterpret_cast<void *>(&fstatat);
+    if (sf) {
+        void *bk = kpm_inline_hooker(sf, reinterpret_cast<void *>(&GcashFstatatHook));
+        if (bk) { g_gc_orig_fstatat = reinterpret_cast<int (*)(int, const char *, void *, int)>(bk);
+                  LOGI("[gcashfix] traceless-hooked fstatat @ {} (hide root paths)", sf); }
+        else LOGW("[gcashfix] kpm_inline_hooker(fstatat) FAILED");
+    } else {
+        LOGW("[gcashfix] fstatat symbol not found");
+    }
+    // Hook __openat (the internal both open()+openat() funnel through; libloader hooks the public
+    // `open`, not this) to sanitize /proc/{mounts,self/mountinfo} -> hide module/overlay mounts.
+    // GATED OFF by default (persist.kpmhook.unpack.gcashopenat=1 to enable): hooking __openat, a
+    // very hot libc funnel, self-interferes with Vector's OWN hook-dex loading (openDexFileNative ->
+    // ZipArchive::OpenFromFdInternal -> SIGSEGV in libartbase). faccessat/fstatat already hide root.
+    if (PropInt("persist.kpmhook.unpack.gcashopenat", 0)) {
+        void *of = dlsym(RTLD_DEFAULT, "__openat");
+        if (!of) {
+            vector::native::ElfImage libc("libc.so");
+            if (libc.IsValid()) {
+                of = const_cast<void *>(libc.getSymbAddress<const void *>("__openat"));
+                if (!of) of = const_cast<void *>(libc.getSymbAddress<const void *>("___openat"));
+            }
+        }
+        if (of) {
+            void *bk = kpm_inline_hooker(of, reinterpret_cast<void *>(&GcashOpenatHook));
+            if (bk) { g_gc_orig_openat = reinterpret_cast<int (*)(int, const char *, int, int)>(bk);
+                      LOGI("[gcashfix] traceless-hooked __openat @ {} (sanitize /proc/mounts)", of); }
+            else LOGW("[gcashfix] kpm_inline_hooker(__openat) FAILED");
+        } else {
+            LOGW("[gcashfix] __openat symbol not found");
+        }
+    } else {
+        LOGI("[gcashfix] __openat hook SKIPPED (gated off — avoids Vector dex-load self-interference)");
+    }
+
+    // Dump libloader's runtime-DECRYPTED 2nd-detection region (RE: exit site 0x386adc, encrypted
+    // on disk) to logcat, for offline RE of what that inline-svc-self-kill check reads.
+    {
+        uintptr_t lb = FindLibBase("libloader.so");
+        if (lb) {
+            const unsigned char *p = reinterpret_cast<const unsigned char *>(lb + 0x386800);
+            for (unsigned o = 0; o < 0x800; o += 32) {
+                char hex[80];
+                int n = 0;
+                for (int j = 0; j < 32; j++) n += snprintf(hex + n, sizeof(hex) - n, "%02x", p[o + j]);
+                LOGI("[gcashdump] +{:x} {}", 0x386800 + o, hex);
+            }
+        }
+    }
+
+    int total_hidden = 0;
+    for (int round = 0; round < 30; round++) {  // ~6s of coverage @200ms
+        FILE *f = fopen("/proc/self/maps", "re");
+        if (!f) break;
+        char line[600];
+        int this_round = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (!MapsLineIsInjected(line)) continue;
+            uintptr_t start = 0, end = 0;
+            if (sscanf(line, "%lx-%lx", &start, &end) != 2 || !start || end <= start) continue;
+            // One hide at the VMA start (hidergn is expected VMA-granular). If a test shows a VMA
+            // only partially hidden, switch to a per-page loop here.
+            if (kpm_hide_region(reinterpret_cast<void *>(start))) {
+                total_hidden++;
+                this_round++;
+            }
+        }
+        fclose(f);
+        if (round == 0)
+            LOGI("[gcashfix] maps-hide round0: hid {} injected VMA(s)", this_round);
+        usleep(200 * 1000);
+    }
+    LOGI("[gcashfix] maps-hide done: {} page-hides total", total_hidden);
+}
+
 void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
+    // GCash Ant-APSE neutralize: race to KPM-traceless-hook libloader's detect fn BEFORE its
+    // ~2-7s self-check fires. Needs no JNI/ART -- run it first (the KPM gate is already set via
+    // kpm_hook_set_process_name in StartIfEnabled) to win the race.
+    if (cfg.gcash_fix) {
+        RunGcashNeutralize(vm, cfg.gcash_off);
+        return;
+    }
+
     // Attach to the ART runtime so we hold a valid art::Thread* for the driver.
     JNIEnv *env = nullptr;
     if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
@@ -329,6 +747,8 @@ Config ReadConfigFromProps() {
     c.openat_probe = PropIs("persist.kpmhook.unpack.openat", '1');
     c.openat_ms = PropInt("persist.kpmhook.unpack.openat_ms", 20000);
     c.openat_dobby = PropIs("persist.kpmhook.unpack.openat_dobby", '1');
+    c.gcash_fix = PropIs("persist.kpmhook.unpack.gcashfix", '1');
+    c.gcash_off = (unsigned long) PropInt("persist.kpmhook.unpack.gcashoff", 0x1d0bb0);
     return c;
 }
 

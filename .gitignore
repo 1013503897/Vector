@@ -11,3 +11,12 @@ build
 bin/
 # local NDK/gradle build logs
 _build*.log
+
+# agent scratch & generated mcp skeletons
+.claude/
+zygisk/mcps/
+# python caches under tools
+tools/**/__pycache__/
+# hookmodule ndk-build outputs (source in jni/ is tracked)
+tools/hookmodule/libs/
+tools/hookmodule/obj/
