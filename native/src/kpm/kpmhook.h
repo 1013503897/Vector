@@ -41,6 +41,18 @@ extern "C" {
 void kpm_hook_force_enable(void);
 
 /*
+ * Rev1-(1): enable the ghost main-path. When on, every NEW region clone is hosted in
+ * VMA-less kernel memory (KPM `pghookg`) instead of an anonymous RX mmap, so the
+ * recompiled hook code is unreachable by /proc/maps + mincore enumeration (it stays
+ * directly readable only if its VA is already known). Off by default -- the proven
+ * userspace-clone path is unchanged until a caller opts in. Call before the first
+ * kpm_inline_hooker(); affects regions created after the call. Requires the on-device
+ * shpte KPM to be >= v0.6.2 (it understands `pghookg`); on an older KPM the pghookg
+ * reply is not "ok", the hook returns NULL, and the caller falls back to Dobby.
+ */
+void kpm_hook_set_ghost(int on);
+
+/*
  * Tell the KPM process gate the real package/process name. Vector calls this from
  * postAppSpecialize (where the app's nice_name is known) BEFORE LSPlant installs its
  * inline hooks -- at hook time /proc/self/cmdline is still "zygote64", so the backend

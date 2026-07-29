@@ -50,6 +50,11 @@ extern "C" int kpm_hide_region(void *addr);
 // StartIfEnabled and only for in-scope apps -- so the traceless worker must set it itself
 // or the gate latches g_init_failed on the stale "zygote64" cmdline.
 extern "C" void kpm_hook_set_process_name(const char *name);
+// Rev1-(1): host every traceless clone in VMA-less kernel memory (KPM `pghookg`) instead of
+// an anon RX mmap, so the recompiled hook code is unreachable by maps/mincore enumeration.
+// Off by default in the backend; enabled once in StartIfEnabled. Safe: on a pre-0.6.2 KPM the
+// pghookg reply isn't "ok", the hook returns NULL, and we fall back exactly as before.
+extern "C" void kpm_hook_set_ghost(int on);
 
 #include "unpack/art_internal.h"      // CalibrateForMethodEnum (increment-2)
 #include "unpack/choke_hook.h"        // ChokePoint
@@ -766,6 +771,9 @@ bool StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const cha
     // Tell the KPM gate who we are BEFORE the worker calls kpm_inline_hooker (see the extern
     // decl above). Without this the openat/traceless path fails the gate and latches.
     kpm_hook_set_process_name(process_name);
+    // Rev1-(1): host traceless clones VMA-less (enumeration-blind). Must precede the first
+    // kpm_inline_hooker; affects regions created after. Auto-falls-back on a pre-0.6.2 KPM.
+    kpm_hook_set_ghost(1);
     // Output dir. Default = the app's INTERNAL data dir (/data/user/0/<pkg>/unpack). On a hardened
     // app with strict SELinux MLS categories (e.g. GCash), a locked-down su can't read those files
     // (can't relabel/setenforce), so pulling the dump fails. extout=1 writes to the app's EXTERNAL
