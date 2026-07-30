@@ -55,6 +55,10 @@ extern "C" void kpm_hook_set_process_name(const char *name);
 // Off by default in the backend; enabled once in StartIfEnabled. Safe: on a pre-0.6.2 KPM the
 // pghookg reply isn't "ok", the hook returns NULL, and we fall back exactly as before.
 extern "C" void kpm_hook_set_ghost(int on);
+// fs-hide: register this process's tgid so the KPM spoofs its statfs f_type (overlayfs->erofs) and
+// drops overlay/magisk lines from its mountinfo -- defeats the "hidden overlayfs" mount detection.
+// Needs shpte KPM >= v0.6.6 (older KPM replies "usage:" -> harmless no-op). Gated persist.kpmhook.fshide.
+extern "C" void kpm_hook_fshide_enable(void);
 
 #include "unpack/art_internal.h"      // CalibrateForMethodEnum (increment-2)
 #include "unpack/choke_hook.h"        // ChokePoint
@@ -774,6 +778,10 @@ bool StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const cha
     // Rev1-(1): host traceless clones VMA-less (enumeration-blind). Must precede the first
     // kpm_inline_hooker; affects regions created after. Auto-falls-back on a pre-0.6.2 KPM.
     kpm_hook_set_ghost(1);
+    // fs-hide: spoof this process's statfs f_type (overlayfs->erofs) + drop overlay/magisk mount
+    // lines, so the app's own root-detection can't catch the "hidden overlayfs" inconsistency.
+    // Default on; disable with `resetprop persist.kpmhook.fshide 0`. Harmless no-op on <0.6.6 KPM.
+    if (PropInt("persist.kpmhook.fshide", 1)) kpm_hook_fshide_enable();
     // Output dir. Default = the app's INTERNAL data dir (/data/user/0/<pkg>/unpack). On a hardened
     // app with strict SELinux MLS categories (e.g. GCash), a locked-down su can't read those files
     // (can't relabel/setenforce), so pulling the dump fails. extout=1 writes to the app's EXTERNAL

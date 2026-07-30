@@ -53,6 +53,14 @@ void kpm_hook_force_enable(void);
 void kpm_hook_set_ghost(int on);
 
 /*
+ * Enable the kernel fs-hide for THIS process: register our tgid so the KPM spoofs its statfs
+ * f_type (overlayfs -> erofs) and drops overlay/magisk lines from its /proc/self/mountinfo +
+ * /proc/self/mounts -- defeats the "hidden overlayfs" mount detection. Reader-gated to our tgid
+ * (root's own views stay truthful). Call once from postAppSpecialize. No-op on a pre-0.6.6 KPM.
+ */
+void kpm_hook_fshide_enable(void);
+
+/*
  * Tell the KPM process gate the real package/process name. Vector calls this from
  * postAppSpecialize (where the app's nice_name is known) BEFORE LSPlant installs its
  * inline hooks -- at hook time /proc/self/cmdline is still "zygote64", so the backend

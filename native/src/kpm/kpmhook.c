@@ -464,6 +464,25 @@ void kpm_hook_force_enable(void) { g_force_enable = 1; }
 
 void kpm_hook_set_ghost(int on) { g_ghost = on ? 1 : 0; }
 
+/* Enable the kernel fs-hide for THIS process: arm the statfs/mountinfo hooks and register our own
+ * tgid in the KPM hide-set, so this app's statfs f_type reads overlayfs->erofs and its mountinfo/
+ * mounts drop the overlay/magisk lines -- defeats the "hidden overlayfs" mount detection. Reader-
+ * gated to our tgid only (root's own views stay truthful). Idempotent; call once from
+ * postAppSpecialize (like set_ghost). No-op/harmless on a pre-0.6.6 KPM (reply != "ok"). */
+void kpm_hook_fshide_enable(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) {
+        pthread_mutex_unlock(&g_lock);
+        return; /* gated out or bridge off -- nothing to do */
+    }
+    char cmd[64], out[256];
+    bridge_cmd("fshide on", out, sizeof out);
+    snprintf(cmd, sizeof cmd, "fshide add %d", g_pid);
+    bridge_cmd(cmd, out, sizeof out);
+    pthread_mutex_unlock(&g_lock);
+}
+
 void kpm_hook_set_process_name(const char *name)
 {
     pthread_mutex_lock(&g_lock);
