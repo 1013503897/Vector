@@ -27,6 +27,14 @@ The framework allows modules to modify system and application behavior in-memory
 > so the target's `.text` is never modified (CRC- and maps-scan-safe). It falls back to Dobby when
 > the KPM bridge is unarmed.
 
+**What this fork adds** (beyond upstream JingMatrix/Vector):
+
+- **KPM traceless backend** — inline hooks leave the target's `.text` unmodified (see the note above), defeating CRC / self-checksum and `/proc/maps` scans.
+- **fs-hide** — kernel-side `statfs` / `mountinfo` anti-detection (hides the overlayfs/magisk mounts) for injected targets, reader-gated so root's own views stay truthful.
+- **Ghost main-path** — hook clones live in VMA-less "ghost" memory, invisible to `/proc/maps` + `mincore`.
+- **Traceless unpacker** — on-device DEX reconstruction via a KPM clone of ART's `FindClass` (no `.text` patch).
+- **SSOL Java-layer hooks** — single-step-out-of-line for dense framework JIT, keeping ART's PC→method map / stack unwind / GC / deopt intact.
+
 ---
 
 ### Compatibility
@@ -107,7 +115,7 @@ This project is made possible by the following open-source contributions:
 *   [Magisk](https://github.com/topjohnwu/Magisk/): The foundation of Android customization.
 *   [LSPlant](https://github.com/JingMatrix/LSPlant): The core ART hooking engine.
 *   [XposedBridge](https://github.com/rovo89/XposedBridge): The standard Xposed APIs.
-*   [Dobby](https://github.com/JingMatrix/Dobby): Inline hooking implementation.
+*   [Dobby](https://github.com/JingMatrix/Dobby): Inline hooking implementation (fallback backend; this fork's primary is the KPM traceless engine).
 *   [LSPosed](https://github.com/LSPosed/LSPosed): Upstream source.
 *   [xz-embedded](https://github.com/tukaani-project/xz-embedded): Library decompression utilities.
 
