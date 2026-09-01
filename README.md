@@ -19,6 +19,14 @@ Vector is a Zygisk module providing an ART hooking framework that maintains API 
 
 The framework allows modules to modify system and application behavior in-memory. Because no APK files are modified, changes are non-destructive, easily reversible via reboot, and compatible across various ROMs and Android versions.
 
+> [!NOTE]
+> **KPM traceless backend (this fork).** `HookInline`/`UnhookInline` route through a kernel-level
+> traceless-hook engine from **[stealth-poc](https://github.com/1013503897/stealth-poc)** (its
+> `lib/kpmhook` + `lib/dbi` are vendored into `native/src/kpm`): real libart functions are
+> intercepted via UXN page-fault **region clones** / **SSOL** executing from VMA-less ghost memory,
+> so the target's `.text` is never modified (CRC- and maps-scan-safe). It falls back to Dobby when
+> the KPM bridge is unarmed.
+
 ---
 
 ### Compatibility
