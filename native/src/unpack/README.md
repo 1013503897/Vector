@@ -6,17 +6,14 @@ primitives as M-C: `ElfSymbolCache` (symbol resolution), `kpm_inline_hooker`
 (kpm/kpmhook.h, traceless hook), and the post-init worker pattern of
 `zygisk/src/main/cpp/module.cpp` `RunTracelessConvert` (module.cpp:307).
 
-## ⚠️ Status: INERT — does NOT build into anything yet
+## Status: ACTIVE (default OFF at runtime)
 
-`native/CMakeLists.txt` does `file(GLOB_RECURSE NATIVE_SOURCES "src/*.cpp")`, so these
-`.cpp` files ARE swept into the build. To keep Vector's (actively-changing) build green
-and this scaffold zero-impact, **every `.cpp` body is wrapped in
-`#ifdef VECTOR_UNPACK_ENABLED`** (never defined). Result: each is an empty translation
-unit → compiles to nothing → no symbols, no behavior, cannot break the build.
-
-Nothing here is called from `module.cpp`. The unpacker is completely dormant until
-deliberately wired (see "Wiring" below). This matches "scaffold only, don't compile/test,
-Vector next door is still being changed".
+`native/CMakeLists.txt` now defines `VECTOR_UNPACK_ENABLED`, and `module.cpp` calls
+`vector::native::unpack::StartIfEnabled(...)` post-init, so the unpacker IS compiled and wired.
+Every `.cpp` body is still wrapped in `#ifdef VECTOR_UNPACK_ENABLED` (flip the define off to
+excise it to empty translation units). At **runtime** it is a no-op unless
+`persist.kpmhook.unpack=1` AND the process is the `persist.kpmhook.target` app — see
+"Runtime props" below.
 
 ## File map
 
@@ -35,16 +32,74 @@ Vector next door is still being changed".
 - **P2** — offline DEX reassembler (host-side, lives in `tools/dexfixer/`, NOT here).
 - **P3** — choke point → `kpm_inline_hooker` (stealth=1) + one-time DBI correctness check on that one function + maps hide. (the only DBI cost; see design §4.)
 
-## Wiring (do NOT do yet — Vector build in flux)
+## Wiring (done)
 
-When ready to activate:
-1. Add `-DVECTOR_UNPACK_ENABLED` to the native target's compile options (or `#define` it).
-2. In `module.cpp`, after `RunTracelessConvert();` (the post-init worker, module.cpp:755),
-   call `vector::native::unpack::StartIfEnabled(g_vm, env_);`.
-3. Gate at runtime with `persist.kpmhook.unpack=1`, `unpack.tier=A|B|C`,
-   `unpack.stealth=0|1`, `unpack.choke=invoke|bridge|execute` (see `unpacker.cpp`).
-4. The choke point defaults to `ArtMethod::Invoke` (small fn → cheap DBI clone). Do NOT
-   default to `Execute` (huge/multi-page → hardest DBI case; design §4).
+Activated as designed:
+1. `native/CMakeLists.txt` defines `VECTOR_UNPACK_ENABLED` on the native target.
+2. `module.cpp` calls `vector::native::unpack::StartIfEnabled(...)` post-init.
+3. Runtime gating — see "Runtime props" above (`persist.kpmhook.unpack*`).
+4. The tier-based choke point defaults to `ArtMethod::GetCodeItem`; do NOT default the choke to
+   `Execute` (huge/multi-page → hardest DBI case; design §4). The primary path is now
+   `dexfind`(+`trigger`)/`interp`, not the tier choke.
+
+## Runtime props (`persist.kpmhook.*`)
+
+All gated behind `persist.kpmhook.unpack=1` + `persist.kpmhook.target=<pkg>` (the app's nice
+name). Set with `resetprop` (APatch: `/data/adb/ap/bin/resetprop`). Output lands in
+`<app_data>/unpack` (or the app's EXTERNAL dir with `extout=1`).
+
+| prop (`persist.kpmhook.unpack…`) | default | meaning |
+|---|---|---|
+| `` (bare `.unpack`) | 0 | master enable |
+| `.stealth` | 0 | choke hook via KPM traceless (1) vs Dobby (0) |
+| `.traceless` | 0 | dexfind `FindClass` hook via KPM clone (1) vs Dobby (0) — RASP-safe |
+| `.dexfind` | 0 | per-class dex discovery via ART `VisitClasses` (reaches header-mangled dexes) |
+| `.trigger` | 0 | per-method `GetCodeItem` force-restore → `captures.txt` (needs `dexfind`) |
+| `.interp` | 0 | interpreter-point capture (hook `art::interpreter::Execute`, FART-style) |
+| `.interp_ms` | 30000 | interp capture window |
+| `.activeload` | 0 | `Class.forName` every class (per-class DefineClass-restore shells, e.g. dpt) |
+| `.extout` | 0 | write dumps to the app's EXTERNAL dir (pullable past strict SELinux MLS) |
+| `.predelay_ms` | 6000 | dexfind: wait before the `FindClass` hook so the app loads its classes |
+| **`.worker_delay_ms`** | **0** | **NEW — sleep before the worker's first ART touch (AttachCurrentThread / `art::Get()`). See "self-libart-patching shells" below.** |
+| `.rounds` / `.interval_ms` | 40 / 400 | whole-dex burst scan (used only when `dexfind`/`interp`/`activeload` all off) |
+
+**KPM engagement is now gated** (`StartIfEnabled`): the process is identified to the shpte KPM
+(`set_process_name` + `ghost` + `fshide`) **only** when a KPM path is actually used
+(`stealth=1 || traceless=1 || gcashfix || openat`). A pure-Dobby run (`stealth=0 traceless=0`)
+leaves the process off the KPM's radar entirely — otherwise the KPM PTE-manages the target's
+libart pages and collides with packers that patch libart themselves.
+
+### Recipe — whole-dex encryption shell (Bangcle/SecNeo, 百度加固, …)
+
+```
+resetprop persist.kpmhook.unpack 1
+resetprop persist.kpmhook.target <pkg>
+resetprop persist.kpmhook.unpack.dexfind 1        # + traceless=1 if the app RASP-scans libart
+```
+`dexfind` alone dumps the decrypted whole dexes (method bodies intact); no `trigger` needed.
+
+### Recipe — method-extraction shell that self-patches libart (51job `s.h.e.l.l`)
+
+Such a shell maps a **private libart copy** at startup and inline-hooks it. That routine faults
+`SEGV_ACCERR` (killing the app <1s in) if the worker touches ART while it runs, **and** the app's
+dexes exceed a single VMA. Use pure Dobby + a settle delay:
+
+```
+resetprop persist.kpmhook.unpack 1
+resetprop persist.kpmhook.target com.job.android
+resetprop persist.kpmhook.unpack.stealth 0            # pure Dobby -> KPM not engaged
+resetprop persist.kpmhook.unpack.traceless 0
+resetprop persist.kpmhook.unpack.dexfind 1
+resetprop persist.kpmhook.unpack.trigger 1            # per-method CodeItem capture
+resetprop persist.kpmhook.unpack.worker_delay_ms 12000  # let the shell finish patching libart first
+resetprop persist.kpmhook.unpack.extout 1
+```
+Launch the app, drive the UI (to invoke the methods you want restored) during/after the delay, then
+pull `captures.txt` + `region_*_fixed.dex`. `DumpRegionsForPointers` reads multi-region dexes by
+`file_size`, so the big structure dexes reconstruct whole. Offline: map each capture region to a
+structure dex by method count (`(region, method_idx)` is self-consistent) and disassemble the
+captured CodeItems against that dex's constant pool. (This recovered 51job's request-sign from
+364k+ captures.)
 
 ## Hard limits (design §8)
 
