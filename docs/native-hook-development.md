@@ -17,7 +17,7 @@
 | hook ART 内部 / Java 方法 | **路线 3**：lsplant DSL + worker 线程（参照 unpacker） |
 
 样例模块已写好并编译验证：`tools/hookmodule/libs/arm64-v8a/libvechook.so`（导出 `native_init`，
-arm64-v8a，minSdk 27）。它对 `com.moneydd.goodmoney`（DexProtector 加固的 Flutter 贷款 app）
+arm64-v8a，minSdk 27）。它对一个 DexProtector 加固的 Flutter app
 做了三件事：打印每次 `dlopen`、hook `openat`（看文件访问）、hook `__system_property_get`
 （看指纹/反模拟器读取），并演示了"库加载后再 hook 它导出符号"的 late-hook 模板。
 
@@ -107,8 +107,7 @@ Vector 是 LSPosed 派生框架，native 模块走 Xposed 模块加载链：
 3. **触发加载**：模块的 Java/Kotlin 入口（标准 Xposed 模块，AndroidManifest 带
    `xposedmodule` meta-data）在目标进程里 `System.loadLibrary("vechook")`，这步会 `dlopen`
    你的 `.so` → Vector 的 `do_dlopen` hook 命中已注册名 → 调 `native_init`。
-4. **启用 + 限定作用域**：在 Vector 管理器里启用该模块，作用域勾选目标 app（如
-   `com.moneydd.goodmoney`）。
+4. **启用 + 限定作用域**：在 Vector 管理器里启用该模块，作用域勾选目标 app。
 5. 启动目标 app → `native_init` 触发 → hook 安装 → 看日志。
 
 加载时管理器对每个声明的库名调 `NativeAPI.recordNativeEntrypoint(name)`
@@ -228,10 +227,9 @@ tools/hookmodule/
 
 ## 附：实测记录（2026-06-23）
 
-- 目标：offer 3101651 → `com.moneydd.goodmoney`（Good Money，TH 贷款 CPI，Adjust 归因，
-  DexProtector 加固的 Flutter app；native 含 ML Kit OCR / OpenCV / TFLite / face 库）。
+- 目标：一个 DexProtector 加固的 Flutter app（native 含 ML Kit OCR / OpenCV / TFLite / face 库）。
 - 设备：Pixel 6（oriole，Android 16，APatch + Vector）。
-- 结果：XAPK 5-split `install-multiple` 成功，启动到 Thai 通知权限弹窗（splash 正常转），
+- 结果：XAPK 5-split `install-multiple` 成功，启动到通知权限弹窗（splash 正常转），
   **未崩溃、未 root 拦截、未区域闪退**，DexProtector 初始启动通过。
 - 模块：`libvechook.so` 已编译并验证导出 `native_init`；端到端注入测试（打模块包 + 管理器
   启用 + 看 hook 日志）是下一步。
