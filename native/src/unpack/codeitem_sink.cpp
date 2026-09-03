@@ -468,33 +468,51 @@ void CodeItemSink::DumpRegionsForPointers(const void *const *ptrs, size_t n) {
             std::lock_guard<std::mutex> g(lock_);
             if (FindRangeLocked(live) >= 0) continue;  // already dumped (a prior scan/pass)
         }
-        buf.resize(rsize);
-        if (!ReadRegionGuarded(live, rsize, buf.data())) continue;
+        // Multi-region dex: a real dex whose header.file_size EXCEEDS this VMA spans into the
+        // following (contiguous) memory. Read file_size, not just rsize, so a large dex is captured
+        // WHOLE instead of truncated — the plain VMA read + the burst scan's `i+fsize<=rsize` bound
+        // both drop these, which is exactly why an extraction shell's big (multi-VMA) restored dexes
+        // never reassembled. Peek the header first (page 0 of this region), then extend the read.
+        size_t read_size = rsize;
+        {
+            uint8_t hdr[0x28];
+            std::vector<uint8_t> peek(0x28);
+            if (ReadRegionGuarded(live, 0x28, peek.data())) {
+                memcpy(hdr, peek.data(), 0x28);
+                if (hdr[0] == 'd' && hdr[1] == 'e' && hdr[2] == 'x' && hdr[3] == '\n') {
+                    uint32_t fsz = *reinterpret_cast<const uint32_t *>(hdr + 0x20);
+                    if (fsz > rsize && fsz <= (96u << 20)) read_size = fsz;
+                }
+            }
+        }
+        buf.resize(read_size);
+        if (!ReadRegionGuarded(live, read_size, buf.data())) continue;
 
         std::lock_guard<std::mutex> g(lock_);
         if (FindRangeLocked(live) >= 0) continue;
         uint32_t id = (uint32_t)dex_count_++;
-        ranges_.push_back({live, live + rsize, id});
+        ranges_.push_back({live, live + read_size, id});
 
         char path[320];
-        snprintf(path, sizeof(path), "%s/region_%lx_%zu.bin", dir_, (unsigned long)s, rsize);
+        snprintf(path, sizeof(path), "%s/region_%lx_%zu.bin", dir_, (unsigned long)s, read_size);
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
         if (fd >= 0) {
             size_t off = 0;
-            while (off < rsize) {
-                ssize_t w = write(fd, buf.data() + off, rsize - off);
+            while (off < read_size) {
+                ssize_t w = write(fd, buf.data() + off, read_size - off);
                 if (w <= 0) break;
                 off += (size_t)w;
             }
             fsync(fd);
             close(fd);
             dumped++;
-            LOGI("[unpack] region dump -> {} ({} bytes)", path, off);
+            LOGI("[unpack] region dump -> {} ({} bytes{})", path, off,
+                 read_size > rsize ? " [multi-region dex, extended to file_size]" : "");
         }
         // Defer on-device reconstruction to pass 2 (below) — it must run with NO fault guard
         // installed: reconstruction reads only safe heap, but if it ever faulted under the guard the
         // handler would siglongjmp to a stale jmp_buf (PC=0 crash). Record the region for pass 2.
-        recon.emplace_back(s, rsize);
+        recon.emplace_back(s, read_size);
     }
     RemoveFaultGuard();
 
@@ -545,6 +563,23 @@ void CodeItemSink::DumpRegionsForPointers(const void *const *ptrs, size_t n) {
 
 size_t CodeItemSink::DumpMethodCaptures(const MethodCapture *caps, size_t n) {
     if (!inited_ || !caps || n == 0) return 0;
+
+    // Dump the regions the captures actually reference BEFORE keying captures.txt to them. The
+    // captures' owning dexes (classdef pointers) frequently land in regions the dexfind `defs`
+    // pass did NOT dump — e.g. a method-extraction shell whose GetCodeItem restore re-points the
+    // class to a freshly-allocated "restored dex" region that isn't among the pre-restore `defs`.
+    // Those regions are still mapped RIGHT NOW (region_of below finds them), but they're transient
+    // and get recycled, so dump them here, at capture-flush time, or splice.py has captures.txt
+    // keys with no matching region_<start>_<size>_fixed.dex. Dedup is handled inside
+    // DumpRegionsForPointers (already-dumped regions are skipped).
+    {
+        static std::vector<const void *> cds;
+        cds.clear();
+        cds.reserve(n);
+        for (size_t i = 0; i < n; i++)
+            if (caps[i].classdef) cds.push_back(caps[i].classdef);
+        if (!cds.empty()) DumpRegionsForPointers(cds.data(), cds.size());
+    }
 
     // maps snapshot: classdef pointer -> owning region start (== the dumped region's key).
     std::vector<std::pair<uintptr_t, uintptr_t>> regs;  // sorted [start,end)

@@ -640,6 +640,22 @@ void WorkerMain(JavaVM *vm, Config cfg, std::string out_dir) {
         return;
     }
 
+    // Pre-attach settle delay. Some extraction shells (51job's s.h.e.l.l) run a startup routine
+    // that maps a PRIVATE libart copy and inline-hooks ~7 libart functions into it — and that
+    // routine faults SEGV_ACCERR (killing the app <1s in) if ANY concurrent JNI thread attach /
+    // ART surface access happens WHILE it runs (reproducible: the crash fires the instant this
+    // worker's AttachCurrentThread + art::Get() touch the runtime, before any hook is even
+    // installed). Sleeping here BEFORE the first ART interaction lets that startup routine finish;
+    // the worker then attaches/hooks against a settled runtime. Default 0 (no delay) preserves the
+    // original behavior for every other packer. For interp/trigger capture the sign path is driven
+    // AFTER this delay, so a late hook still catches it.
+    int worker_delay = PropInt("persist.kpmhook.unpack.worker_delay_ms", 0);
+    if (worker_delay > 0) {
+        LOGI("[unpack] worker: pre-attach settle delay {}ms (let self-libart-patching packer finish "
+             "startup before we touch ART)", worker_delay);
+        for (int w = 0; w < worker_delay; w += 200) usleep(200 * 1000);
+    }
+
     // Attach to the ART runtime so we hold a valid art::Thread* for the driver.
     JNIEnv *env = nullptr;
     if (vm->AttachCurrentThread(&env, nullptr) != JNI_OK || !env) {
@@ -772,16 +788,30 @@ bool StartIfEnabled(JavaVM *vm, JNIEnv *env, const char *app_data_dir, const cha
         LOGW("[unpack] StartIfEnabled: no JavaVM");
         return false;
     }
-    // Tell the KPM gate who we are BEFORE the worker calls kpm_inline_hooker (see the extern
-    // decl above). Without this the openat/traceless path fails the gate and latches.
-    kpm_hook_set_process_name(process_name);
-    // Rev1-(1): host traceless clones VMA-less (enumeration-blind). Must precede the first
-    // kpm_inline_hooker; affects regions created after. Auto-falls-back on a pre-0.6.2 KPM.
-    kpm_hook_set_ghost(1);
-    // fs-hide: spoof this process's statfs f_type (overlayfs->erofs) + drop overlay/magisk mount
-    // lines, so the app's own root-detection can't catch the "hidden overlayfs" inconsistency.
-    // Default on; disable with `resetprop persist.kpmhook.fshide 0`. Harmless no-op on <0.6.6 KPM.
-    if (PropInt("persist.kpmhook.fshide", 1)) kpm_hook_fshide_enable();
+    // Engage the KPM (identify this proc to its gate, arm ghost/fshide) ONLY when a run actually
+    // uses a KPM path (traceless/stealth hooks, or the gcashfix/openat traceless probes). A
+    // pure-Dobby unpack (interp/dexfind with stealth=0 traceless=0) needs NONE of this, and merely
+    // TARGETING the process in the shpte KPM makes it PTE-manage this proc's libart pages — which
+    // COLLIDES with packers that mmap/patch libart.so themselves (51job's s.h.e.l.l maps a private
+    // libart and copies function prologues into it; the KPM-managed page then faults SEGV_ACCERR on
+    // the packer's own write, killing the app at startup before any hook is even installed). So gate
+    // the KPM engagement: a Dobby-only run leaves this proc off the KPM's radar entirely.
+    const bool uses_kpm = cfg.stealth || cfg.traceless || cfg.gcash_fix || cfg.openat_probe;
+    if (uses_kpm) {
+        // Tell the KPM gate who we are BEFORE the worker calls kpm_inline_hooker (see the extern
+        // decl above). Without this the openat/traceless path fails the gate and latches.
+        kpm_hook_set_process_name(process_name);
+        // Rev1-(1): host traceless clones VMA-less (enumeration-blind). Must precede the first
+        // kpm_inline_hooker; affects regions created after. Auto-falls-back on a pre-0.6.2 KPM.
+        kpm_hook_set_ghost(1);
+        // fs-hide: spoof this process's statfs f_type (overlayfs->erofs) + drop overlay/magisk mount
+        // lines, so the app's own root-detection can't catch the "hidden overlayfs" inconsistency.
+        // Default on; disable with `resetprop persist.kpmhook.fshide 0`. Harmless no-op on <0.6.6 KPM.
+        if (PropInt("persist.kpmhook.fshide", 1)) kpm_hook_fshide_enable();
+    } else {
+        LOGI("[unpack] pure-Dobby run (stealth=0 traceless=0) -> NOT engaging KPM (avoids "
+             "PTE-page collision with self-libart-patching packers)");
+    }
     // Output dir. Default = the app's INTERNAL data dir (/data/user/0/<pkg>/unpack). On a hardened
     // app with strict SELinux MLS categories (e.g. GCash), a locked-down su can't read those files
     // (can't relabel/setenforce), so pulling the dump fails. extout=1 writes to the app's EXTERNAL
