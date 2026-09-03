@@ -122,7 +122,7 @@ adb -s <设备> logcat -s vechook:V          # 你的模块
 
 确认 KPM 后端是否生效：日志若打印 `KPM inline hook failed ... falling back to Dobby`
 （Vector tag）说明走了 Dobby（仍可用，只是有 inline 痕迹）；要 traceless 需先 boot-time
-起 bridge（见 `kpm-device-test-workflow` / `kpm-probe`）。
+起 KPM bridge。
 
 ---
 
@@ -221,15 +221,12 @@ tools/hookmodule/
 | `native_init` 不触发 | 模块 `.so` 没在目标进程被 `dlopen`（确认 Java 侧 `System.loadLibrary` + 名字在 `native_init.list` + 管理器里模块已启用且作用域含目标 app） |
 | hook 装上但不打印 | re-entrancy guard 吞了（log 自身触发）或目标函数没被调用；换更热的符号验证 |
 | app 崩 / pc=0 | 跨页函数被单页 clone，或 hook 了 ART 内部却没在 runnable 线程；参照 unpacker 的 fault-guard |
-| 日志显示 falling back to Dobby | KPM bridge 没起；要 traceless 先 boot-time `shctl <KEY> load shpte.kpm; control shpte probe; control shpte bridge` |
+| 日志显示 falling back to Dobby | KPM bridge 没起；要 traceless 先 boot-time 起 KPM bridge（加载 `shpte.kpm` 并 arm bridge） |
 
 ---
 
-## 附：实测记录（2026-06-23）
+## 附：适用性
 
-- 目标：一个 DexProtector 加固的 Flutter app（native 含 ML Kit OCR / OpenCV / TFLite / face 库）。
-- 设备：Pixel 6（oriole，Android 16，APatch + Vector）。
-- 结果：XAPK 5-split `install-multiple` 成功，启动到通知权限弹窗（splash 正常转），
-  **未崩溃、未 root 拦截、未区域闪退**，DexProtector 初始启动通过。
-- 模块：`libvechook.so` 已编译并验证导出 `native_init`；端到端注入测试（打模块包 + 管理器
-  启用 + 看 hook 日志）是下一步。
+样例模块（`libvechook.so`）已在 arm64-v8a / minSdk 27 下编译并验证导出 `native_init`，
+面向 DexProtector 加固的 Flutter app（native 含 ML Kit OCR / OpenCV / TFLite / face 库）等
+常见目标——`do_dlopen` 观测 + late-hook 模板对这类"库延迟加载"的加固 app 尤其适用。
