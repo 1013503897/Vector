@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     env:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
@@ -111,4 +113,16 @@ jobs:
         with:
           name: symbols
           path: build/symbols
+
+      - name: Publish release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Vector ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            zygisk/release/Vector-v*-Release.zip
+            zygisk/release/Vector-v*-Debug.zip
 
