@@ -145,7 +145,7 @@ Vector 是一个 Zygisk 模块，提供与原版 Xposed 保持 API 一致的 ART
 - **fs-hide** — 内核侧对注入目标做 `statfs` / `mountinfo` 过滤（按读者门控，root 自身视图保持真实）。
 - **Ghost 主路径** — Hook 克隆位于无 VMA 的 ghost 内存。
 - **无痕脱壳** — 通过 ART `FindClass` 的 KPM 克隆在设备上重建 DEX（不打 `.text` 补丁）。
-- **SSOL Java 层 Hook** — 针对密集 framework JIT 的 single-step-out-of-line，尽量保持 ART 的 PC→method、栈展开、GC、deopt  intact。
+- **SSOL Java 层 Hook** — 针对密集 framework JIT 的 single-step-out-of-line，尽量保持 ART 的 PC→method、栈展开、GC、deopt 完整可用。
 
 ### 兼容性
 
