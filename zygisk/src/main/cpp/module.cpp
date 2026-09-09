@@ -772,7 +772,23 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     RunL2SelfTest(env_);
     if (env_) env_->GetJavaVM(&g_vm);  // for the traceless-convert worker thread (needs ART attach)
     // M-C: upgrade the early in-place hooks to traceless post-init (no-op unless persist.kpmhook.fc=1).
-    RunTracelessConvert();
+    // ONLY in the KPM target process. ConvertToTraceless installs SSOL BRK traps whose handling
+    // depends on the KPM single-step handler, which is armed ONLY for persist.kpmhook.target. In any
+    // other injected process (notably the parasitic manager, nice_name==kManagerPackageName) the
+    // traps are unhandled -> the BRK executes -> SIGTRAP kills the process (signal 5; no tombstone).
+    // This is what makes the manager "闪退". Non-target processes never need traceless anyway (see the
+    // note above: "every other process falls back to Dobby"), so gate the convert on the target.
+    {
+        char kpm_target[PROP_VALUE_MAX] = {0};
+        bool is_kpm_target = __system_property_get("persist.kpmhook.target", kpm_target) > 0 &&
+                             kpm_target[0] && strcmp(nice_name_str.get(), kpm_target) == 0;
+        if (is_kpm_target) {
+            RunTracelessConvert();
+        } else {
+            LOGD("[convert] skip in '{}' (not KPM target '{}') — SSOL traps would be unhandled -> SIGTRAP",
+                 nice_name_str.get(), kpm_target[0] ? kpm_target : "<unset>");
+        }
+    }
     // (The stealth unpacker is started earlier in postAppSpecialize -- before the IPC-binder
     // scope check -- so it runs even for apps outside Vector's hooking scope.)
     // Hide the LSPlant trampoline pool (rwxp anon) from this process's maps/smaps (no-op unless
