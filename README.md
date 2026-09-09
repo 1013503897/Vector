@@ -2,8 +2,8 @@
 
 # Vector Framework
 
-**A high-performance ART hooking framework for modern Android**  
-**面向现代 Android 的高性能 ART Hook 框架**
+**A Zygisk ART Hooking Framework with KPM Traceless Backend**  
+**集成 KPM 内核无痕后端的 Zygisk ART Hook 框架**
 
 [English](#english) · [中文](#中文)
 
@@ -29,53 +29,42 @@ Vector is a Zygisk module providing an ART hooking framework that maintains API 
 The framework allows modules to modify system and application behavior in-memory. Because no APK files are modified, changes are non-destructive, easily reversible via reboot, and compatible across various ROMs and Android versions.
 
 > [!NOTE]
-> **KPM traceless backend (this fork).** `HookInline`/`UnhookInline` route through a kernel-level
-> traceless-hook engine from **[stealth-poc](https://github.com/1013503897/stealth-poc)** (its
-> `lib/kpmhook` + `lib/dbi` are vendored into `native/src/kpm`): real libart functions are
-> intercepted via UXN page-fault **region clones** / **SSOL** executing from VMA-less ghost memory,
-> so the target's `.text` is never modified (CRC- and maps-scan-safe). It falls back to Dobby when
-> the KPM bridge is unarmed.
+> **KPM traceless backend (this fork):** `HookInline`/`UnhookInline` route through the kernel-level
+> traceless-hook engine from **[stealth-core](https://github.com/1013503897/stealth-core)** (`lib/kpmhook`
+> and `lib/dbi` vendored in `native/src/kpm`). Native libart functions are intercepted via UXN
+> page-fault **region clones** / **SSOL** in VMA-less ghost memory, leaving the target `.text`
+> unmodified to pass memory CRC and `/proc/maps` scans. Falls back to Dobby when the KPM bridge is unarmed.
 
-**What this fork adds** (beyond upstream JingMatrix/Vector):
+**Fork Features** (beyond upstream JingMatrix/Vector):
 
-- **KPM traceless backend** — inline hooks leave the target's `.text` unmodified (see the note above).
-- **fs-hide** — kernel-side `statfs` / `mountinfo` filtering for injected targets (reader-gated so root's own views stay truthful).
-- **Ghost main-path** — hook clones live in VMA-less "ghost" memory.
-- **Traceless unpacker** — on-device DEX reconstruction via a KPM clone of ART's `FindClass` (no `.text` patch).
-- **SSOL Java-layer hooks** — single-step-out-of-line for dense framework JIT, keeping ART's PC→method map / stack unwind / GC / deopt intact.
+- **KPM Traceless Backend**: Inline hooks do not modify target `.text` bytes (see note above).
+- **Kernel-side fs-hide**: Transparently filter `statfs` and `mountinfo` for target processes via reader gating.
+- **Ghost Memory Execution**: Hook clone code runs in unmapped VMA-less memory invisible to `/proc/*/maps` and `mincore`.
+- **Traceless Unpacker**: On-device DEX extraction hooking ART `FindClass` without modifying runtime `.text`.
+- **SSOL Java Hooking**: Single-step-out-of-line execution for framework JIT methods, keeping ART method tables, stack unwinding, GC, and deopt intact.
 
 ### Compatibility
 
-Vector supports devices running **Android 8.1 through Android 17 Beta**.
-
-> [!TIP]
-> This framework requires a recent installation of Magisk or KernelSU with Zygisk enabled.
+Android **8.1 through Android 17 Beta** (ARM64). Requires Magisk or KernelSU with Zygisk enabled.
 
 ### Installation
 
-1. Download the latest release as a system module.
-2. Install the module via your root manager (Magisk / KernelSU).
-3. Ensure a Zygisk environment (e.g. [NeoZygisk](https://github.com/JingMatrix/NeoZygisk)).
+1. Download the release module zip.
+2. Flash the module via your root manager (Magisk / KernelSU / APatch).
+3. Ensure a working Zygisk environment (e.g. NeoZygisk / Zygisk Next).
 4. Reboot the device.
-5. Access management settings via the system notification.
+5. Configure modules and scopes through the manager UI or CLI.
 
 ### Downloads
 
 | Channel | Source |
 | :--- | :--- |
 | **Stable Releases** | [GitHub Releases](https://github.com/1013503897/Vector/releases) |
-| **Canary (CI) Builds** | [GitHub Actions](https://github.com/1013503897/Vector/actions/workflows/core.yml?query=branch%3Amaster) |
-| **Upstream (JingMatrix)** | [JingMatrix/Vector](https://github.com/JingMatrix/Vector) |
+| **CI Builds** | [GitHub Actions](https://github.com/1013503897/Vector/actions/workflows/core.yml?query=branch%3Amaster) |
+| **Upstream** | [JingMatrix/Vector](https://github.com/JingMatrix/Vector) |
 
-> [!NOTE]
-> Debug builds are recommended for users encountering issues or performing troubleshooting.
-> We encourage users to test CI builds to help identify bugs and accelerate development.
-
-> [!CAUTION]
-> GitHub requires users to be **logged in** to download CI artifacts.
->
-> The link above is filtered to show only `master` branch builds.
-> Builds from Pull Requests are often unstable; stay on `master` unless you are helping with debugging.
+* CI artifact downloads require a GitHub login.
+* Builds on `master` branch are recommended for testing. Debug builds provide verbose logging for troubleshooting.
 
 ### Support and Contribution
 
@@ -108,7 +97,7 @@ Vector supports devices running **Android 8.1 through Android 17 Beta**.
 * [Dobby](https://github.com/JingMatrix/Dobby): inline hooking (fallback backend; this fork's primary is the KPM traceless engine).
 * [LSPosed](https://github.com/LSPosed/LSPosed): upstream source.
 * [xz-embedded](https://github.com/tukaani-project/xz-embedded): library decompression utilities.
-* [stealth-poc](https://github.com/1013503897/stealth-poc): KPM traceless-hook engine vendored into this fork.
+* [stealth-core](https://github.com/1013503897/stealth-core): KPM traceless-hook engine vendored into this fork.
 
 <details>
 <summary>Legacy and Historical Dependencies</summary>
@@ -132,61 +121,47 @@ Vector is licensed under the [GNU General Public License v3](http://www.gnu.org/
 
 ### 简介
 
-Vector 是一个 Zygisk 模块，提供与原版 Xposed 保持 API 一致的 ART Hook 框架。它基于 [LSPlant](https://github.com/JingMatrix/LSPlant) 构建，用于提供稳定的 native 级插桩环境。
+Vector 是一个基于 [LSPlant](https://github.com/JingMatrix/LSPlant) 的 Zygisk 模块，提供兼容原生 Xposed API 的 Native 级 ART Hook 运行时。
 
-模块可在内存中修改系统与应用行为；由于不改写 APK 文件，改动是非破坏性的，重启即可还原，并兼容多种 ROM 与 Android 版本。
+本分支的核心演进在于**将底层 Inline Hook 后端接入内核级无痕引擎**：通过引入 [stealth-core](https://github.com/1013503897/stealth-core) 的 KPM 模块，使框架在注入与拦截过程中无需改写目标进程的代码段（`.text`），以此抵御严格的反作弊、内存完整性自校验与 `/proc/maps` 内存特征扫描。
 
-> [!NOTE]
-> **KPM 无痕后端（本 fork）。** `HookInline` / `UnhookInline` 走 **[stealth-poc](https://github.com/1013503897/stealth-poc)** 的内核级无痕 Hook 引擎（`lib/kpmhook` + `lib/dbi` 已 vendor 到 `native/src/kpm`）：通过 UXN 缺页 **region clones** / **SSOL**，在无 VMA 的 ghost 内存中执行，不修改目标 `.text`。KPM bridge 未就绪时回退到 Dobby。
+### 分支增强特性
 
-**相对上游 JingMatrix/Vector，本 fork 额外提供：**
-
-- **KPM 无痕后端** — 内联 Hook 不修改目标 `.text`（见上）。
-- **fs-hide** — 内核侧对注入目标做 `statfs` / `mountinfo` 过滤（按读者门控，root 自身视图保持真实）。
-- **Ghost 主路径** — Hook 克隆位于无 VMA 的 ghost 内存。
-- **无痕脱壳** — 通过 ART `FindClass` 的 KPM 克隆在设备上重建 DEX（不打 `.text` 补丁）。
-- **SSOL Java 层 Hook** — 针对密集 framework JIT 的 single-step-out-of-line，尽量保持 ART 的 PC→method、栈展开、GC、deopt 完整可用。
+- **KPM 内核无痕后端**：`HookInline` / `UnhookInline` 优先路由至 `stealth-core`。通过 UXN 缺页异常触发，在无 VMA 的 ghost 内存中执行 DBI 重编译克隆或 SSOL 单步模拟，目标 `.text` 原始字节一字不改。KPM 通道未武装时自动回退至 Dobby。
+- **内核级文件系统隐藏 (fs-hide)**：内核拦截目标进程的 `statfs` 与 `mountinfo` 调用，屏蔽 Magisk 与 OverlayFS 挂载特征（读进程门控，保持 root 视图真实）。
+- **Ghost 内存执行**：Hook 克隆段位于未挂载 VMA 的物理映射页中，免疫 `/proc/*/maps` 遍历与 `mincore` 扫描。
+- **内存无痕脱壳**：通过 KPM 劫持 ART `FindClass`，在不打 `.text` 补丁的前提下在设备端抓取并重建内存 DEX。
+- **SSOL Java 方法 Hook**：面向 Android Framework 高频 JIT 代码的单步出线执行，维持 ART 方法表映射、栈回溯、GC 与 deopt 的原生行为。
 
 ### 兼容性
 
-支持 **Android 8.1 至 Android 17 Beta**。
+支持 **Android 8.1 至 Android 17 Beta**（ARM64）。运行依赖 Magisk / KernelSU / APatch 及其 Zygisk 实现（如 NeoZygisk / Zygisk Next）。
 
-> [!TIP]
-> 需要较新的 Magisk 或 KernelSU，并启用 Zygisk。
+### 安装方式
 
-### 安装
-
-1. 从 Release 下载最新系统模块。
-2. 用 Magisk / KernelSU 安装模块。
-3. 确保 Zygisk 环境可用（例如 [NeoZygisk](https://github.com/JingMatrix/NeoZygisk)）。
+1. 从 Release 页面下载模块压缩包。
+2. 在 Root 管理器（Magisk / KernelSU / APatch）中刷入模块。
+3. 确保 Zygisk 环境正常运行。
 4. 重启设备。
-5. 通过系统通知进入管理界面。
+5. 通过系统通知或管理器 CLI 配置模块与作用域。
 
-### 下载
+### 产物与渠道
 
-| 渠道 | 来源 |
+| 渠道 | 链接 |
 | :--- | :--- |
-| **稳定版** | [GitHub Releases](https://github.com/1013503897/Vector/releases) |
-| **金丝雀（CI）** | [GitHub Actions](https://github.com/1013503897/Vector/actions/workflows/core.yml?query=branch%3Amaster) |
-| **上游（JingMatrix）** | [JingMatrix/Vector](https://github.com/JingMatrix/Vector) |
+| **稳定版本** | [GitHub Releases](https://github.com/1013503897/Vector/releases) |
+| **CI 构建** | [GitHub Actions](https://github.com/1013503897/Vector/actions/workflows/core.yml?query=branch%3Amaster) |
+| **上游原项目** | [JingMatrix/Vector](https://github.com/JingMatrix/Vector) |
 
-> [!NOTE]
-> 排查问题时建议使用 Debug 构建。也欢迎试 CI 构建，帮助发现缺陷。
+* CI 产物下载需登录 GitHub。
+* 排查 Hook 故障与异常时，推荐切换至 Debug 构建获取详细诊断日志。
 
-> [!CAUTION]
-> 下载 CI 产物需要 **登录 GitHub**。
->
-> 上方链接已过滤为 `master` 分支构建。PR 构建往往不稳定；除非协助调试，请留在 `master`。
+### 支持与讨论
 
-### 支持与贡献
-
-* **排障：** 提交前可先参考 [上游指南](https://github.com/JingMatrix/Vector/issues/123)。
-* **讨论：** [GitHub Discussions](https://github.com/JingMatrix/Vector/discussions)（上游社区）。
-* **本地化：** [Crowdin](https://crowdin.com/project/lsposed_jingmatrix)。
-* **本 fork 的 Issue：** 请开在 [1013503897/Vector](https://github.com/1013503897/Vector/issues)。
-
-> [!IMPORTANT]
-> 仅接受基于 **最新 Debug 构建** 的问题反馈。
+* **排障参考：** 提 issue 前可先查阅 [上游指南](https://github.com/JingMatrix/Vector/issues/123)。
+* **上游讨论区：** [GitHub Discussions](https://github.com/JingMatrix/Vector/discussions)。
+* **本地化翻译：** [Crowdin](https://crowdin.com/project/lsposed_jingmatrix)。
+* **本分支 Issue：** 请提交至 [1013503897/Vector](https://github.com/1013503897/Vector/issues)。
 
 ### 开发者资源
 
@@ -195,9 +170,7 @@ Vector 是一个 Zygisk 模块，提供与原版 Xposed 保持 API 一致的 ART
 * [Xposed Module Repository](https://github.com/Xposed-Modules-Repo)
 
 > [!NOTE]
-> Vector 通过两个 git submodule 支持 `libxposed` API：[module API](./xposed/) 与 [service API](./services/)。
->
-> [master](https://github.com/1013503897/Vector/tree/master) 分支上成功的 GitHub Actions 构建，表示在对应 commit 上对这些 API 有完整支持。开发时请对齐 Vector 所用的相同 commit。
+> Vector 通过两个 git submodule 支持 `libxposed` API：[module API](./xposed/) 与 [service API](./services/)。开发时请对齐 Vector 所引用的对应 commit。
 
 ### 致谢
 
@@ -205,10 +178,10 @@ Vector 是一个 Zygisk 模块，提供与原版 Xposed 保持 API 一致的 ART
 * [Magisk](https://github.com/topjohnwu/Magisk/)：Android 定制基础。
 * [LSPlant](https://github.com/JingMatrix/LSPlant)：核心 ART Hook 引擎。
 * [XposedBridge](https://github.com/rovo89/XposedBridge)：标准 Xposed API。
-* [Dobby](https://github.com/JingMatrix/Dobby)：内联 Hook（回退后端；本 fork 主路径为 KPM 无痕引擎）。
-* [LSPosed](https://github.com/LSPosed/LSPosed)：上游来源。
+* [Dobby](https://github.com/JingMatrix/Dobby)：内联 Hook 回退后端。
+* [LSPosed](https://github.com/LSPosed/LSPosed)：上游源码基础。
 * [xz-embedded](https://github.com/tukaani-project/xz-embedded)：解压工具库。
-* [stealth-poc](https://github.com/1013503897/stealth-poc)：本 fork 引入的 KPM 无痕 Hook 引擎。
+* [stealth-core](https://github.com/1013503897/stealth-core)：本 fork 引入的 KPM 内核级无痕 Hook 引擎。
 
 <details>
 <summary>历史依赖</summary>

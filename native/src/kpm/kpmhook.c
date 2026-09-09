@@ -10,6 +10,22 @@
 // modified; the clone is visible in /proc/maps -- the maps-hide hook covers that
 // separately). Original execution is rerouted into the clone by the kernel fault
 // router; the KPM only reads our offmap, never the clone bytes.
+//
+// -------------------------------------------------------------------------------------------
+// VENDORED from stealth-core @ 2a148bca2e4ef00ba1cdf5eb58122ec87c51b406 (upstream date 2026-09-01).
+// This is NOT a byte-for-byte copy of stealth-core lib/kpmhook.c -- it is a documented superset.
+// Vector-side deltas (see native/src/kpm/SYNC.md for the authoritative, line-referenced list):
+//   * process gating: INJECTED_PACKAGE_NAME / INJECTED_PACKAGE_UID compile gates + the runtime
+//     kpm_hook_set_process_name() name channel (the app name is unknown at hook time in Vector).
+//   * inlined SSOL *client* glue (kpm_ssol_hooker/kpm_ssol_unhooker + srgn/sov tables) that
+//     drives the KPM `ssolhook`/`ssolunhook` bridge commands. NOTE: this is the userspace
+//     bridge client, a DIFFERENT layer from stealth-core's lib/ssol.c (which is the offline SSOL
+//     *simulator* that runs kernel-side); there is no upstream client file to converge toward.
+//   * kpm_hide_region() maps-hide client, and the SSOL teardown loop in kpm_hook_shutdown().
+//   * the bridge `version` handshake client (verify_bridge_version_locked; bridge-protocol.md).
+// Keep the shared clone-path logic (make_rgn/find_rgn/emit/offmap) in lock-step with upstream:
+// when syncing an upstream fix, apply it here too and record it in SYNC.md.
+// -------------------------------------------------------------------------------------------
 
 #include <android/log.h>
 #include <fcntl.h>
@@ -55,6 +71,14 @@
 #define RGN_CLONE_CAP (RGN_INSN_MAX * 6)         /* clone scratch: ~5x expansion + headroom */
 #define KPM_MAX_REGIONS 16         /* must not exceed the KPM's MAX_PG */
 #define KPM_MAX_OV 8               /* must not exceed the KPM's MAX_OV */
+#define CLIENT_BRIDGE_PROTO 1      /* bridge wire protocol this client speaks (see docs/bridge-protocol.md) */
+
+/* #12: bridge `version` handshake -- ADVISORY-ONLY (defined after the SSOL caps below so it can
+ * bound-check them for the diagnostic). Forward-declared here for ensure_init_locked(). It ONLY
+ * logs; it MUST NOT change any hook/fallback decision -- falling back to Dobby is fatal on
+ * anti-tamper targets like GCash (SIGKILL), so a missing/mismatched `version` must never disable
+ * the KPM backend. See its definition for the full rationale. */
+static void advise_bridge_version_locked(void);
 
 struct ov {
     uint64_t off;   /* REGION-relative byte offset of the hooked entry */
@@ -86,8 +110,14 @@ struct rgn {
 };
 
 static struct rgn g_rgns[KPM_MAX_REGIONS];
-static uint32_t g_clonebuf[CLONE_CAP]; /* characterize dbi scratch, reused under g_lock */
-static uint32_t g_scratch_omap[CLONE_CAP]; /* characterize dbi offmap scratch, under g_lock */
+/* #6/P6: the census recompiles ONE function of up to fn_len_insns()'s 2048-insn cap; with the
+ * 128-bit SIMD LDR-literal form now emitting 6 clone words per insn (dbi.c insn_size), the clone
+ * can reach ~6x -> ~12288 words. CLONE_CAP (6144) was too small: dbi_recompile returned
+ * DBI_ERR_RANGE and the census silently logged dbi_rc=-1. Size the clone scratch for the real
+ * worst case so the dry-run actually measures the span it exists to measure. */
+#define CENSUS_CLONE_CAP 16384
+static uint32_t g_clonebuf[CENSUS_CLONE_CAP]; /* characterize dbi clone scratch, reused under g_lock */
+static uint32_t g_scratch_omap[CLONE_CAP]; /* characterize dbi offmap scratch (<= src insns), under g_lock */
 /* static .bss buffer handed to the KPM's access_process_vm (reused under g_lock): the
  * KPM copies it into its own vmalloc immediately, so this need not persist. Scudo's
  * high mmap-region heap pages are NOT GUP-readable by access_process_vm (got=0), but a
@@ -136,15 +166,18 @@ static int proc_is_target(void)
         name = cmd;
     }
 
-#ifdef KPM_TARGET_UID
     /* UID fallback: the injected host is UID-specialized at hook time even when no name was
-     * passed (e.g. 2000 = the shell-UID parasitic LSPosed manager host). */
+     * passed (e.g. 2000 = the shell-UID parasitic LSPosed manager host). KPM_TARGET_UID is
+     * ALWAYS defined (INJECTED_PACKAGE_UID from the build, or the 2000 fallback above), so this
+     * is an unconditional check -- no `#ifdef` needed (it was always true). */
     if ((int)getuid() == KPM_TARGET_UID) return 1;
-#endif
 #ifdef INJECTED_PACKAGE_NAME
     /* the build's injection target (compile-time, SELinux-proof) */
     if (strcmp(name, KPM_STR(INJECTED_PACKAGE_NAME)) == 0) return 1;
 #endif
+    /* KPM_RV0_TARGET / KPM_TARGET are TEST-BUILD-ONLY compile targets (stealth-core's standalone
+     * harness / RV-0 census build); they are NOT defined in Vector's product build, so the two
+     * branches below are dead there. Kept #ifdef-isolated for parity with stealth-core lib/kpmhook.c. */
 #ifdef KPM_RV0_TARGET
     /* compile-time target: SELinux-proof (an untrusted_app cannot read a custom
      * persist.* prop on modern Android). Defined only for the RV-0 characterize build. */
@@ -205,12 +238,13 @@ static void characterize_target(void *target)
     int len = fn_len_insns(t);
     uint64_t end = t + (uint64_t)len * 4;
     int pages = (int)((end - 1) / PAGE_SZ - t / PAGE_SZ + 1);
-    int rc = dbi_recompile(t, (const uint32_t *)t, len + 4, g_clonebuf, CLONE_CAP, g_scratch_omap,
-                           CLONE_CAP);
+    int rc = dbi_recompile(t, (const uint32_t *)t, len + 4, g_clonebuf, CENSUS_CLONE_CAP,
+                           g_scratch_omap, CLONE_CAP);
     __android_log_print(ANDROID_LOG_INFO, KPM_LOG_TAG,
-                        "census target=%p page=0x%lx off=0x%lx len=%d end=0x%lx pages=%d dbi_rc=%d%s",
+                        "census target=%p page=0x%lx off=0x%lx len=%d end=0x%lx pages=%d dbi_rc=%d%s%s",
                         target, (unsigned long)page, (unsigned long)off, len, (unsigned long)end,
-                        pages, rc, pages > 1 ? " SPANS" : "");
+                        pages, rc, pages > 1 ? " SPANS" : "",
+                        rc == DBI_ERR_RANGE ? " (clone > CENSUS_CLONE_CAP: function too large, span not fully measured)" : "");
 }
 
 /* Run a KPM command through the bridge. Fills `out` (NUL-terminated). Returns the KPM
@@ -242,6 +276,12 @@ static int ensure_init_locked(void)
         g_init_failed = 1;
         return -1;
     }
+    /* #12: ADVISORY-ONLY bridge `version` handshake, run once here (this body runs once -- gated by
+     * g_inited/g_init_failed -- so the query never repeats per-hook). It ONLY emits diagnostics; it
+     * deliberately does NOT gate init. Rationale: probe already proved the KPM + bridge are live, and
+     * on an anti-tamper target (GCash) falling back to Dobby = SIGKILL, so a missing/mismatched
+     * `version` (e.g. an in-service KPM predating the command) must NOT disable the KPM backend. */
+    advise_bridge_version_locked();
     g_pid = (int)getpid();
     g_inited = 1;
     return 0;
@@ -285,12 +325,12 @@ static uint64_t next_rgn_base_locked(uint64_t base, uint64_t cap)
 
 /* Bounds of the contiguous READABLE mapping containing `addr` (extends across adjacent
  * readable VMAs): returns the extent END, sets *out_start to the extent START, or 0 if
- * addr is not in a readable mapping. Two uses, both against hardened/packed libs (e.g.
- * GCash's libAPSE) that split their .text with non-readable --xp/---p sub-ranges:
+ * addr is not in a readable mapping. Two uses, both against hardened/packed libs (some
+ * commercial packers) that split their .text with non-readable --xp/---p sub-ranges:
  *   1. cap region expansion at [.,end) so dbi_recompile's [base,end) read stays readable;
  *   2. bound dbi's LDR-literal-pool reads to [start,end) so a bytecode word MISDECODED as
  *      an LDR-literal (obfuscated VM) resolving OUTSIDE the readable extent is SKIPPED, not
- *      read -- that out-of-extent read (e.g. base-486KB, below libAPSE) SIGSEGVs otherwise.
+ *      read -- that out-of-extent read (e.g. base-486KB, below the packed lib) SIGSEGVs otherwise.
  * Reads /proc/self/maps (sleepable install context only, never the fault path); maps are
  * address-sorted. */
 static uint64_t readable_extent(uint64_t addr, uint64_t *out_start)
@@ -380,7 +420,7 @@ static struct rgn *make_rgn_locked(uint64_t target)
     uint64_t collide = next_rgn_base_locked(base, cap);
     if (collide) cap = collide; /* don't overlap an existing region */
     /* never expand into a non-readable page: dbi_recompile reads [base,end) to build the
-     * clone, and packed libs (libAPSE) split .text with non-readable sub-ranges -> a read
+     * clone, and packed libs split .text with non-readable sub-ranges -> a read
      * there SIGSEGVs (the flaky getColorInfo install crash). Cap at base's readable extent
      * and reuse the same [rd_start,rd_end) to bound dbi's literal-pool reads below. */
     uint64_t rd_start = 0;
@@ -460,6 +500,12 @@ static void remove_ov_locked(struct rgn *e, uint64_t off)
         }
 }
 
+/* #P5/#P7: PRECONDITION -- both setters below MUST be called before the first hook (i.e. before
+ * any other thread enters kpm_inline_hooker/kpm_ssol_hooker). Under that contract the writes race
+ * with nothing, so they are intentionally lockless (matches stealth-core lib/kpmhook.c) even though
+ * g_force_enable/g_ghost are read under g_lock on the hook path. Do NOT call them mid-run.
+ * kpm_hook_force_enable is vendored-for-completeness: it has NO Vector caller (Vector relies on the
+ * process gate + Dobby fallback); it exists only for stealth-core's standalone tools/kpmhooktool. */
 void kpm_hook_force_enable(void) { g_force_enable = 1; }
 
 void kpm_hook_set_ghost(int on) { g_ghost = on ? 1 : 0; }
@@ -559,6 +605,17 @@ void *kpm_inline_hooker(void *target, void *hooker)
         /* surface the KPM's exact reject reply to logcat (e.g. "error: ghost inject failed
          * rc=-6") -- the one diagnostic worth having when a device test can't be re-run cheaply */
         __android_log_print(ANDROID_LOG_WARN, KPM_LOG_TAG, "hook reject: cmd=[%s] reply=[%s]", cmd, out);
+        /* #P1: if this region was FRESHLY made for this hook (no live overrides yet), the KPM
+         * never armed it -- release the clone mmap + offmap and free the registry slot so a
+         * rejected hook doesn't leak a region (clone VMA + heap offmap + a KPM_MAX_REGIONS slot).
+         * Mirrors the SSOL "freshly-made-but-unused" release in kpm_ssol_hooker and make_rgn's own
+         * error unwinds. A REUSED region (nov>0) still backs other live hooks -> keep it. `clone`
+         * is an mmap in BOTH legacy and ghost mode, so munmap is always correct here. */
+        if (e->nov == 0) {
+            munmap(e->clone, e->clone_sz);
+            free(e->offmap);
+            e->used = 0;
+        }
         backup = 0;
         goto out;
     }
@@ -570,27 +627,42 @@ out:
     return backup;
 }
 
+/* #P2: TRI-STATE return (was a plain 0/1 "ok" that conflated two very different zeros).
+ *   -1 = NOT a KPM hook (bridge down, or this addr was never region-hooked) -> caller should
+ *        DobbyDestroy it.
+ *    0 = it IS our KPM hook but the bridge teardown FAILED -> the KPM trap may still be armed.
+ *        The caller must NOT then DobbyDestroy (this addr was never Dobby-hooked); it should
+ *        surface the failure. We also WARN here so the reject is never silent.
+ *    1 = torn down cleanly.
+ * UnhookInline (native_api.h) branches on all three. */
 int kpm_inline_unhooker(void *func)
 {
-    int ok = 0;
+    int rc = -1; /* default: not ours -> caller falls back to Dobby */
     pthread_mutex_lock(&g_lock);
-    if (!g_inited) goto out;
+    if (!g_inited) goto out; /* bridge never armed -> no KPM hooks exist -> treat as not-ours */
 
     uintptr_t f = (uintptr_t)func;
     struct rgn *e = find_rgn_locked(f);
-    if (!e) goto out; /* not a KPM-hooked function -> caller uses Dobby */
+    if (!e) goto out; /* not a KPM-hooked function -> -1 (caller uses Dobby) */
     uint64_t roff = f - e->base; /* region-relative */
 
     char cmd[128], out[256];
     snprintf(cmd, sizeof cmd, "pgunhook %d 0x%lx 0x%lx", g_pid, (unsigned long)e->base,
              (unsigned long)roff);
     bridge_cmd(cmd, out, sizeof out);
-    ok = reply_ok(out);
-    if (ok) remove_ov_locked(e, roff); /* keep the clone/offmap until shutdown */
+    if (reply_ok(out)) {
+        remove_ov_locked(e, roff); /* keep the clone/offmap until shutdown */
+        rc = 1;
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, KPM_LOG_TAG,
+                            "pgunhook FAILED (KPM trap may still be armed): cmd=[%s] reply=[%s]",
+                            cmd, out);
+        rc = 0; /* ours, but teardown failed -- caller must NOT DobbyDestroy */
+    }
 
 out:
     pthread_mutex_unlock(&g_lock);
-    return ok;
+    return rc;
 }
 
 /* ===================== SSOL traceless-hook path (Java methods) =====================
@@ -613,6 +685,80 @@ out:
 #define SSOL_MAX_OV 16      /* hooked qc per region; must not exceed the KPM's MAX_SSOL_OV (16) */
 #define SSOL_BK_BASE 0x5500000000ULL
 #define SSOL_XOL_BASE 0x5540000000ULL
+
+/* ===================== #12: bridge `version` handshake client (ADVISORY-ONLY) =====================
+ * Contract: stealth-core/docs/bridge-protocol.md. At init (once) we send the literal command
+ * "version" and parse the reply
+ *     ok: shptbridge proto=1 MAX_RGN=64 MAX_PG=16 MAX_OV=8 MAX_GHOST_PG=512 MAX_SSOL_RGN=16 ...
+ *
+ * ⚠️ CRITICAL DESIGN NOTE -- the handshake is ADVISORY-ONLY: it emits diagnostics and NOTHING else.
+ * It must NEVER disable the KPM backend, set g_init_failed, or otherwise change a hook/fallback
+ * decision. Reason: on an anti-tamper target (e.g. GCash), falling back to Dobby is FATAL -- a Dobby
+ * inline patch trips the app's self-check and the process is SIGKILL'd. A new Vector running against
+ * an in-service KPM that predates the `version` command must keep working exactly as before. probe
+ * already proved the bridge is live; `version` only tells a human whether the two sides' ABI match.
+ *
+ *   - no `ok: shptbridge` prefix (old KPM doesn't know the command) -> INFO, keep using KPM (compat).
+ *   - proto mismatch / a client cap exceeds the KPM's -> prominent ERROR for ABI-drift triage, but
+ *     STILL keep using KPM (do not touch the hook path). */
+
+/* Parse a decimal `key=value` token (matched at a word boundary). Returns 1 + *out on success. */
+static int bridge_kv(const char *s, const char *key, long *out)
+{
+    size_t klen = strlen(key);
+    for (const char *p = s; (p = strstr(p, key)); p += klen) {
+        if ((p == s || p[-1] == ' ') && p[klen] == '=') { /* word-boundary + '=' */
+            *out = strtol(p + klen + 1, NULL, 10);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* ADVISORY-ONLY: logs an ABI diagnostic and returns void. Never gates init. Called once from
+ * ensure_init_locked() under g_lock (naturally cached: that body runs once). */
+static void advise_bridge_version_locked(void)
+{
+    char out[256];
+    bridge_cmd("version", out, sizeof out);
+    static const char PFX[] = "ok: shptbridge";
+    if (strncmp(out, PFX, sizeof(PFX) - 1) != 0) {
+        /* Old KPM without the `version` command (or a stray reply). This is NOT an error: the proven
+         * clone/SSOL path predates `version`. Keep using the KPM. */
+        __android_log_print(ANDROID_LOG_INFO, KPM_LOG_TAG,
+                            "bridge `version` absent/unrecognized (reply=[%s]); assuming a pre-version "
+                            "KPM -- continuing in compat mode, KPM backend stays ENABLED.", out);
+        return;
+    }
+    long proto = 0;
+    if (!bridge_kv(out, "proto", &proto) || proto != CLIENT_BRIDGE_PROTO) {
+        __android_log_print(ANDROID_LOG_ERROR, KPM_LOG_TAG,
+                            "bridge proto MISMATCH (client=%d, reply=[%s]) -- ABI drift, please "
+                            "investigate. KPM backend left ENABLED (fallback would be fatal on "
+                            "protected targets).", CLIENT_BRIDGE_PROTO, out);
+        return;
+    }
+    /* Diagnostic capacity check: each client compile-time cap should be <= the KPM's reported value. */
+    long max_rgn = 0, max_pg = 0, max_ov = 0, max_ssol_rgn = 0, max_ssol_ov = 0;
+    bridge_kv(out, "MAX_RGN", &max_rgn);
+    bridge_kv(out, "MAX_PG", &max_pg);
+    bridge_kv(out, "MAX_OV", &max_ov);
+    bridge_kv(out, "MAX_SSOL_RGN", &max_ssol_rgn);
+    bridge_kv(out, "MAX_SSOL_OV", &max_ssol_ov);
+    if (MAX_RGN_PAGES > max_rgn || KPM_MAX_REGIONS > max_pg || KPM_MAX_OV > max_ov ||
+        SSOL_MAX_REGIONS > max_ssol_rgn || SSOL_MAX_OV > max_ssol_ov) {
+        __android_log_print(ANDROID_LOG_ERROR, KPM_LOG_TAG,
+                            "bridge capacity SMALLER than this client expects "
+                            "(need RGN=%d PG=%d OV=%d SSOL_RGN=%d SSOL_OV=%d; KPM reply=[%s]) -- ABI "
+                            "drift, please investigate. KPM backend left ENABLED (fallback would be "
+                            "fatal on protected targets).",
+                            MAX_RGN_PAGES, KPM_MAX_REGIONS, KPM_MAX_OV, SSOL_MAX_REGIONS,
+                            SSOL_MAX_OV, out);
+        return;
+    }
+    __android_log_print(ANDROID_LOG_INFO, KPM_LOG_TAG,
+                        "bridge `version` OK: proto=%ld matches, capacities sufficient.", proto);
+}
 
 struct sov {
     int used;
@@ -751,6 +897,10 @@ out:
     return ok;
 }
 
+/* #P7: vendored-for-completeness -- NO Vector caller. Vector's injected agent lives for the whole
+ * process lifetime and lets the KPM auto-disarm on process exit, so it never calls shutdown; this
+ * exists for stealth-core's standalone tools/kpmhooktool (which explicitly tears down). Kept so the
+ * two vendored copies stay in sync. */
 void kpm_hook_shutdown(void)
 {
     pthread_mutex_lock(&g_lock);

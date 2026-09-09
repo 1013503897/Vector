@@ -37,8 +37,8 @@
  *   1. Vector intercepts the loading of your native library (e.g., libnative.so).
  *   2. Vector looks for and calls the `native_init` function within your library.
  *   3. Vector passes a `NativeAPIEntries` struct to your `native_init`,
- *      which contains function pointers to Vector's hooking
- *      and unhooking implementations (powered by Dobby).
+ *      which contains function pointers to Vector's hooking and unhooking
+ *      implementations (KPM traceless backend first, Dobby as the fallback).
  *   4. Your `native_init` function saves these function pointers for later use
  *      and returns a callback function (`NativeOnModuleLoaded`).
  *   5. Vector will then invoke your returned callback every time
@@ -90,7 +90,7 @@ struct NativeAPIEntries {
 // NOTE: Module developers should not include the following INTERNAL definitions.
 
 /*
- * Stealth-hook backend (vendored in native/src/kpm, from ../stealth-poc). These map
+ * Stealth-hook backend (vendored in native/src/kpm, from ../stealth-core). These map
  * LSPlant's inline_hooker/unhooker onto our KernelPatch module over the no-superkey
  * syscall bridge, so the libart inline hooks become traceless (the target .text is
  * never modified -- CRC-clean). kpm_hook_init() returns 0 only when the bridge is
@@ -114,6 +114,31 @@ int kpm_ssol_unhooker(void *func);
 // the KPM's mm-gated maps-hide -- e.g. the LSPlant trampoline pool (rwxp anon). Gated process only.
 int kpm_hide_region(void *addr);
 }
+
+/*
+ * ================== Backend-selection strategy matrix (single source of truth) ==================
+ * There are THREE distinct hook-install strategies in this tree. They deliberately differ; do NOT
+ * "unify" them -- each fallback is chosen for its threat model. Recorded here so the divergence is
+ * intentional and visible instead of being flattened by a well-meaning refactor.
+ *
+ *   1. libart inline (HookInline / UnhookInline below; LSPlant InitInfo.inline_hooker in
+ *      native_api.cpp): KPM region-clone FIRST, then Dobby on failure. Hot libart .text; a Dobby
+ *      trampoline here is acceptable (these processes have no anti-tamper self-check) so falling
+ *      back keeps the framework working when the bridge is down.
+ *
+ *   2. Java-method `qc` traceless (LSPlant InitInfo.traceless_inline_hooker -> kpm_ssol_hooker):
+ *      KPM SSOL FIRST, then the in-place ArtMethod entry swap on failure. NEVER Dobby -- a clone of
+ *      dense framework JIT corrupts (code/data interleave) and a Dobby inline on a cold qc is both
+ *      wrong and pointless. See kpm/kpmhook.c for the clone-vs-SSOL split rationale.
+ *
+ *   3. Unpacker / anti-tamper targets (unpack/choke_hook.cpp InstallBackend, class_dex_finder.cpp,
+ *      the unpacker.cpp gcashfix + openat probes): stealth XOR dobby, selected per call. The
+ *      traceless-ONLY sites (openat/gcashfix/FindClass) call kpm_inline_hooker with NO Dobby
+ *      fallback -- a Dobby/inline patch there gets the process SIGKILL'd by the app's anti-tamper
+ *      guard, so "no hook" is safer than "traced hook". choke_hook's `stealth` flag picks Dobby
+ *      only for benign shells with no self-check.
+ * ==============================================================================================
+ */
 
 namespace vector::native {
 
@@ -142,7 +167,11 @@ bool InstallNativeAPI(const lsplant::HookHandler &handler);
 void RegisterNativeLib(const std::string &library_name);
 
 /**
- * @brief A wrapper around DobbyHook.
+ * @brief Install a traceless inline hook: KPM region-clone backend first, Dobby fallback.
+ *
+ * Routes through the KPM traceless engine (the target's .text is never modified) when its bridge
+ * is armed; falls back to DobbyHook when the bridge is down or this particular target can't be
+ * KPM-hooked. See strategy matrix above (case 1). `backup` receives the call-original pointer.
  */
 inline int HookInline(void *original, void *replace, void **backup) {
     if constexpr (kIsDebugBuild) {
@@ -171,7 +200,10 @@ inline int HookInline(void *original, void *replace, void **backup) {
 }
 
 /**
- * @brief A wrapper around DobbyDestroy.
+ * @brief Remove an inline hook installed by HookInline: KPM unhook first, Dobby fallback.
+ *
+ * Tears down the KPM region hook if this target was KPM-hooked; otherwise removes the Dobby hook.
+ * See strategy matrix above (case 1). Returns 0 on success.
  */
 inline int UnhookInline(void *original) {
     if constexpr (kIsDebugBuild) {
@@ -183,10 +215,18 @@ inline int UnhookInline(void *original) {
                  info.dli_fname ? info.dli_fname : "(unknown file)", info.dli_fbase);
         }
     }
-    // If this target was KPM-hooked, kpm_inline_unhooker tears it down and returns 1;
-    // otherwise (Dobby-hooked, or bridge down) it returns 0 and we use DobbyDestroy.
+    // kpm_inline_unhooker is TRI-STATE (see kpm/kpmhook.h): 1 = KPM hook torn down cleanly;
+    // 0 = it WAS a KPM hook but bridge teardown failed (the KPM trap may still be armed -- must
+    // NOT DobbyDestroy an address that was never Dobby-hooked); -1 = not a KPM hook -> Dobby.
     if constexpr (kUseKpmBackend) {
-        if (kpm_inline_unhooker(original)) return 0;
+        int rc = kpm_inline_unhooker(original);
+        if (rc == 1) return 0;
+        if (rc == 0) {
+            LOGW("KPM unhook FAILED for {} (trap may still be armed); NOT falling back to Dobby",
+                 original);
+            return -1;
+        }
+        // rc == -1: not a KPM hook -> fall through to Dobby.
     }
     return DobbyDestroy(original);
 }

@@ -8,7 +8,7 @@ add_subdirectory(${VECTOR_ROOT}/external external)
 
 file(GLOB_RECURSE NATIVE_SOURCES "src/*.cpp")
 
-# Stealth-hook backend (vendored from ../../stealth-poc/lib): the libdbi AArch64
+# Stealth-hook backend (vendored from ../../stealth-core/lib): the libdbi AArch64
 # recompiler + the kpmhook glue that maps LSPlant's inline_hooker/unhooker onto our
 # KernelPatch module over the no-superkey syscall bridge. Plain C, so not matched by
 # the *.cpp glob above -- list it explicitly (compiled as C, C linkage via kpmhook.h).

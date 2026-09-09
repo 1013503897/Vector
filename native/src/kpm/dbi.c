@@ -2,6 +2,19 @@
 /* libdbi: AArch64 position-independent function recompiler. See dbi.h. */
 
 #include "dbi.h"
+#include "aarch64_decode.h" /* shared classifiers (was 3 drifting copies -- see #6) */
+
+/* Use the consolidated classifiers under this file's historical names. */
+#define sext a64_sext
+#define is_adr a64_is_adr
+#define is_adrp a64_is_adrp
+#define is_b a64_is_b
+#define is_bl a64_is_bl
+#define is_bcond a64_is_bcond
+#define is_cbz a64_is_cbz
+#define is_tbz a64_is_tbz
+#define is_ldrlit a64_is_ldrlit
+#define btarget a64_btarget
 
 /* ---- AArch64 encode helpers ---- */
 static uint32_t enc_ldr_lit64(int rd, int off) { return 0x58000000u | (((uint32_t)(off / 4) & 0x7ffff) << 5) | (rd & 0x1f); }
@@ -9,28 +22,6 @@ static uint32_t enc_b(int off) { return 0x14000000u | ((uint32_t)(off / 4) & 0x0
 #define BR_X16 0xD61F0200u
 #define BLR_X16 0xD63F0200u
 #define RET_X30 0xD65F03C0u
-
-static int64_t sext(int64_t v, int bits) { int s = 64 - bits; return (v << s) >> s; }
-
-/* ---- classify ---- */
-static int is_adr(uint32_t i) { return (i & 0x9F000000u) == 0x10000000u; }
-static int is_adrp(uint32_t i) { return (i & 0x9F000000u) == 0x90000000u; }
-static int is_b(uint32_t i) { return (i & 0xFC000000u) == 0x14000000u; }
-static int is_bl(uint32_t i) { return (i & 0xFC000000u) == 0x94000000u; }
-static int is_bcond(uint32_t i) { return (i & 0xFF000010u) == 0x54000000u; }
-static int is_cbz(uint32_t i) { return (i & 0x7E000000u) == 0x34000000u; }
-static int is_tbz(uint32_t i) { return (i & 0x7E000000u) == 0x36000000u; }
-/* LDR/LDRSW (literal), integer or SIMD, opc 00/01/10 (exclude PRFM opc=11) */
-static int is_ldrlit(uint32_t i) { return (i & 0x3B000000u) == 0x18000000u && ((i >> 30) & 3) != 3; }
-
-/* absolute branch target for any branch-ish insn at pc */
-static uint64_t btarget(uint32_t insn, uint64_t pc)
-{
-    if (is_b(insn) || is_bl(insn)) return pc + ((uint64_t)sext(insn & 0x03ffffff, 26) << 2);
-    if (is_bcond(insn) || is_cbz(insn)) return pc + ((uint64_t)sext((insn >> 5) & 0x7ffff, 19) << 2);
-    if (is_tbz(insn)) return pc + ((uint64_t)sext((insn >> 5) & 0x3fff, 14) << 2);
-    return 0;
-}
 
 /* re-encode a conditional branch (or cbz/cbnz) / tbz to a new clone-relative offset */
 static uint32_t reenc_imm19(uint32_t insn, int rel) { return (insn & 0xFF00001Fu) | (((uint32_t)rel & 0x7ffff) << 5); }
@@ -63,7 +54,11 @@ static int emit_far(uint32_t *out, uint64_t tgt, int call)
 /* size (in clone insns) of the recompiled form of one instruction */
 static int insn_size(uint32_t insn, uint64_t pc, uint64_t fbase, uint64_t fend)
 {
-    if (is_adr(insn) || is_adrp(insn) || is_ldrlit(insn)) return 4;
+    /* 128-bit SIMD LDR (literal) Qt (V=1, opc=0b10) materializes 16 bytes of pool ->
+     * [LDR Qt,#8][B +20][4 data words] = 6 words. All other ADR/ADRP/LDR-literal forms
+     * materialize <= 8 bytes -> 4 words. */
+    if (is_ldrlit(insn)) return (((insn >> 26) & 1) && ((insn >> 30) & 3) == 2) ? 6 : 4;
+    if (is_adr(insn) || is_adrp(insn)) return 4;
     if (is_bl(insn)) return 5;
     if (is_b(insn)) {
         uint64_t t = btarget(insn, pc);
@@ -99,12 +94,28 @@ static int emit_one(uint32_t *out, int o, uint32_t insn, uint64_t pc, uint64_t b
         int64_t imm = sext((insn >> 5) & 0x7ffff, 19);
         uintptr_t lit_addr = (uintptr_t)(pc + ((uint64_t)imm << 2));
         int opc = (insn >> 30) & 3;
-        uint64_t val = 0;
-        if (lit_addr >= lit_lo && lit_addr < lit_hi)
-            val = (opc == 1) ? *(volatile uint64_t *)lit_addr : (uint64_t) * (volatile uint32_t *)lit_addr;
-        out[o++] = (insn & 0xFF00001Fu) | (2u << 5); /* same opc/Rt, imm19 -> [pc,#8] */
-        out[o++] = enc_b(12);
-        out[o++] = (uint32_t)val; out[o++] = (uint32_t)(val >> 32);
+        int is_q = ((insn >> 26) & 1) && opc == 2; /* V=1, opc=0b10 -> 128-bit LDR Qt */
+        if (is_q) {
+            /* materialize the FULL 16-byte pool word, else the relocated LDR Qt would load
+             * the high 64 bits from garbage past a truncated 8-byte copy (the old bug).
+             * Layout: [LDR Qt,#8][B +20][16-byte literal]. Read as 4x u32 (alignment-safe). */
+            uint32_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+            if (lit_addr >= lit_lo && lit_addr + 16 <= lit_hi) {
+                const volatile uint32_t *q = (const volatile uint32_t *)lit_addr;
+                w0 = q[0]; w1 = q[1]; w2 = q[2]; w3 = q[3];
+            }
+            out[o++] = (insn & 0xFF00001Fu) | (2u << 5); /* keep V/opc/Rt; imm19 -> [pc,#8] */
+            out[o++] = enc_b(20);                        /* skip the 4 literal words */
+            out[o++] = w0; out[o++] = w1; out[o++] = w2; out[o++] = w3;
+        } else {
+            uint64_t val = 0;
+            if (lit_addr >= lit_lo && lit_addr < lit_hi)
+                val = (opc == 1) ? *(volatile uint64_t *)lit_addr
+                                 : (uint64_t) * (volatile uint32_t *)lit_addr;
+            out[o++] = (insn & 0xFF00001Fu) | (2u << 5); /* same opc/Rt, imm19 -> [pc,#8] */
+            out[o++] = enc_b(12);
+            out[o++] = (uint32_t)val; out[o++] = (uint32_t)(val >> 32);
+        }
     } else if (is_bl(insn)) {
         o += emit_far(&out[o], btarget(insn, pc), 1);
     } else if (is_b(insn)) {

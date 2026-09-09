@@ -84,8 +84,10 @@ void kpm_hook_shutdown(void);
  * NULL on failure. `target` is the function to hook, `hooker` the replacement. */
 void *kpm_inline_hooker(void *target, void *hooker);
 
-/* LSPlant InitInfo.inline_unhooker: `func` is the original target previously
- * passed to kpm_inline_hooker. Returns 1 on success, 0 on failure. */
+/* LSPlant InitInfo.inline_unhooker: `func` is the original target previously passed to
+ * kpm_inline_hooker. TRI-STATE (Vector delta vs stealth-core): returns -1 if `func` is NOT a KPM
+ * hook (caller should use Dobby), 0 if it IS ours but the bridge teardown FAILED (caller must NOT
+ * DobbyDestroy; the KPM trap may still be armed), or 1 on clean teardown. */
 int kpm_inline_unhooker(void *func);
 
 /* LSPlant InitInfo.traceless_inline_hooker (Java methods only): SSOL-trap the cold

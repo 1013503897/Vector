@@ -1,7 +1,7 @@
 # native/src/unpack — stealth unpacker (INERT scaffold)
 
 Skeleton for the traceless DEX / extraction-shell unpacker. Design spec:
-`../../../../stealth-poc/docs/unpacker-design.md` (sibling repo). Builds on the same
+`../../../../stealth-core/docs/unpacker-design.md` (sibling repo). Builds on the same
 primitives as M-C: `ElfSymbolCache` (symbol resolution), `kpm_inline_hooker`
 (kpm/kpmhook.h, traceless hook), and the post-init worker pattern of
 `zygisk/src/main/cpp/module.cpp` `RunTracelessConvert` (module.cpp:307).

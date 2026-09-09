@@ -154,6 +154,14 @@ subprojects {
             targetCompatibility = androidTargetCompatibility
         }
     }
+    // Keep Kotlin's JVM target aligned with the Java target above. When run against a newer JBR
+    // (Android Studio ships JDK 25), Kotlin would otherwise default jvmTarget to the running JDK,
+    // causing "Inconsistent JVM-target compatibility" against the Java tasks pinned at 21.
+    plugins.withType(org.jetbrains.kotlin.gradle.plugin.KotlinBasePlugin::class.java) {
+        tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile::class.java).configureEach {
+            compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_21) }
+        }
+    }
 }
 
 tasks.register<KtfmtFormatTask>("format") {

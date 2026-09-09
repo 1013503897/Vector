@@ -52,7 +52,7 @@ void DoResolve() {
     auto &I = g_internal;
 
     // TODO(P0): verify these mangled names on the target device's libart .dynsym before
-    // trusting them (use stealth-poc/kpm/elf_syms.py). GetCodeItem / GetDexFile are
+    // trusting them (use stealth-core/kpm/elf_syms.py). GetCodeItem / GetDexFile are
     // frequently INLINED -> may resolve null; then fall back to a struct-offset read of
     // ArtMethod.dex_code_item_offset_ / declaring-class -> dex_cache -> dex_file.
     I.art_method_get_code_item = ResolveFirst<const void *(*)(void *)>(

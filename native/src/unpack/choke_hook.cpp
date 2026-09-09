@@ -1,4 +1,9 @@
-// choke_hook.cpp — see choke_hook.h. INERT until VECTOR_UNPACK_ENABLED.
+// choke_hook.cpp — see choke_hook.h.
+// The whole TU is guarded on VECTOR_UNPACK_ENABLED, but note: Vector's build defines that macro
+// UNCONDITIONALLY (native/CMakeLists.txt:45), so this code is ALWAYS compiled. The unpacker is not
+// gated at compile time -- it is dormant at RUNTIME until persist.kpmhook.unpack=1 (checked in
+// unpacker.cpp StartIfEnabled). The #ifdef exists only so the file can be dropped from a build that
+// omits the macro; do not read it as "off by default".
 
 #ifdef VECTOR_UNPACK_ENABLED
 
