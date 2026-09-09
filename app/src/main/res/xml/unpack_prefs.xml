@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+  ~ This file is part of LSPosed.
+  ~
+  ~ LSPosed is free software: you can redistribute it and/or modify
+  ~ it under the terms of the GNU General Public License as published by
+  ~ the Free Software Foundation, either version 3 of the License, or
+  ~ (at your option) any later version.
+  ~
+  ~ LSPosed is distributed in the hope that it will be useful,
+  ~ but WITHOUT ANY WARRANTY; without even the implied warranty of
+  ~ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  ~ GNU General Public License for more details.
+  ~
+  ~ You should have received a copy of the GNU General Public License
+  ~ along with LSPosed.  If not, see <https://www.gnu.org/licenses/>.
+  -->
+
+<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <PreferenceCategory android:title="@string/unpack_group_target">
+
+        <EditTextPreference
+            android:dialogTitle="@string/unpack_target"
+            android:icon="@drawable/ic_outline_android_24"
+            android:key="unpack_target"
+            android:title="@string/unpack_target"
+            app:useSimpleSummaryProvider="true" />
+
+        <rikka.preference.SimpleMenuPreference
+            android:defaultValue="whole"
+            android:entries="@array/unpack_preset_texts"
+            android:entryValues="@array/unpack_preset_values"
+            android:icon="@drawable/ic_outline_merge_type_24"
+            android:key="unpack_preset"
+            android:summary="%s"
+            android:title="@string/unpack_preset" />
+    </PreferenceCategory>
+
+    <PreferenceCategory android:title="@string/unpack_group_options">
+
+        <rikka.material.preference.MaterialSwitchPreference
+            android:defaultValue="false"
+            android:icon="@drawable/ic_outline_invert_colors_24"
+            android:key="unpack_rasp"
+            android:summary="@string/unpack_rasp_summary"
+            android:title="@string/unpack_rasp" />
+
+        <rikka.material.preference.MaterialSwitchPreference
+            android:defaultValue="false"
+            android:icon="@drawable/ic_outline_dns_24"
+            android:key="unpack_dobby"
+            android:summary="@string/unpack_dobby_summary"
+            android:title="@string/unpack_dobby" />
+
+        <rikka.preference.SimpleMenuPreference
+            android:defaultValue="default"
+            android:entries="@array/unpack_extout_texts"
+            android:entryValues="@array/unpack_extout_values"
+            android:icon="@drawable/ic_baseline_settings_backup_restore_24"
+            android:key="unpack_extout"
+            android:summary="%s"
+            android:title="@string/unpack_extout" />
+
+        <EditTextPreference
+            android:dialogMessage="@string/unpack_interp_ms_summary"
+            android:icon="@drawable/ic_outline_assignment_24"
+            android:key="unpack_interp_ms"
+            android:title="@string/unpack_interp_ms"
+            app:useSimpleSummaryProvider="true" />
+
+        <EditTextPreference
+            android:dialogMessage="@string/unpack_worker_delay_summary"
+            android:icon="@drawable/ic_outline_assignment_24"
+            android:key="unpack_worker_delay"
+            android:title="@string/unpack_worker_delay"
+            app:useSimpleSummaryProvider="true" />
+    </PreferenceCategory>
+
+    <PreferenceCategory android:title="@string/unpack_group_action">
+
+        <Preference
+            android:icon="@drawable/ic_outline_speaker_notes_24"
+            android:key="unpack_arm"
+            android:persistent="false"
+            android:summary="@string/unpack_arm_summary"
+            android:title="@string/unpack_arm" />
+
+        <Preference
+            android:icon="@drawable/ic_outline_restore_24"
+            android:key="unpack_disarm"
+            android:persistent="false"
+            android:summary="@string/unpack_disarm_summary"
+            android:title="@string/unpack_disarm" />
+
+        <Preference
+            android:icon="@drawable/ic_baseline_info_24"
+            android:key="unpack_status"
+            android:persistent="false"
+            android:summary="@string/unpack_status_empty"
+            android:title="@string/unpack_status" />
+    </PreferenceCategory>
+</PreferenceScreen>

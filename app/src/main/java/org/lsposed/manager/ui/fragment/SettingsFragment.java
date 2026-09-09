@@ -162,6 +162,15 @@ public class SettingsFragment extends BaseFragment {
                 );
             }
 
+            Preference unpackTool = findPreference("unpack_tool");
+            if (unpackTool != null) {
+                unpackTool.setVisible(installed);
+                unpackTool.setOnPreferenceClickListener(preference -> {
+                    if (parentFragment != null) parentFragment.safeNavigate(R.id.unpack_fragment);
+                    return true;
+                });
+            }
+
             Preference shortcut = findPreference("add_shortcut");
             if (shortcut != null) {
                 shortcut.setVisible(App.isParasitic);

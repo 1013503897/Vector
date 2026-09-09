@@ -88,4 +88,30 @@
         <item>CHANNEL_NIGHTLY</item>
     </string-array>
 
+    <string-array name="unpack_preset_texts">
+        <item>whole — whole-dex encryption shell</item>
+        <item>extract — self-libart extraction (51job)</item>
+        <item>dpt — per-class DefineClass-restore</item>
+        <item>fart — FART interpreter capture</item>
+    </string-array>
+
+    <string-array name="unpack_preset_values" translatable="false">
+        <item>whole</item>
+        <item>extract</item>
+        <item>dpt</item>
+        <item>fart</item>
+    </string-array>
+
+    <string-array name="unpack_extout_texts">
+        <item>Preset default</item>
+        <item>External dir (pullable)</item>
+        <item>Internal dir</item>
+    </string-array>
+
+    <string-array name="unpack_extout_values" translatable="false">
+        <item>default</item>
+        <item>on</item>
+        <item>off</item>
+    </string-array>
+
 </resources>

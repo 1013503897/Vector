@@ -33,6 +33,10 @@
         android:id="@+id/settings_fragment"
         android:name="org.lsposed.manager.ui.fragment.SettingsFragment"
         android:label="settings" />
+    <fragment
+        android:id="@+id/unpack_fragment"
+        android:name="org.lsposed.manager.ui.fragment.UnpackFragment"
+        android:label="unpack" />
 
     <include app:graph="@navigation/modules_nav" />
     <include app:graph="@navigation/repo_nav" />

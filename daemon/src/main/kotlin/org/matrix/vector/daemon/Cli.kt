@@ -199,7 +199,8 @@ object OutputFormatter {
             ScopeCommand::class,
             ConfigCommand::class,
             DatabaseCommand::class,
-            LogCommand::class])
+            LogCommand::class,
+            UnpackCommand::class])
 class Cli : Callable<Int> {
 
   @Option(
@@ -404,6 +405,78 @@ class LogCommand {
   @Command(name = "clear", description = ["Clear log buffers"])
   fun clear(@Option(names = ["-v", "--verbose"]) verbose: Boolean): Int {
     val req = CliRequest(command = "log", action = "clear", options = mapOf("verbose" to verbose))
+    return OutputFormatter.print(VectorIPC.transmit(req), parent.json)
+  }
+}
+
+@Command(
+    name = "unpack",
+    description = ["Arm/disarm the stealth unpacker (persist.kpmhook.unpack.* presets)"])
+class UnpackCommand {
+  @ParentCommand lateinit var parent: Cli
+
+  @Command(name = "on", description = ["Arm a preset for a package (presets: whole|extract|dpt|fart)"])
+  fun on(
+      @Parameters(index = "0", paramLabel = "PRESET", description = ["whole|extract|dpt|fart"])
+      preset: String,
+      @Parameters(index = "1", paramLabel = "PKG") pkg: String,
+      @Option(
+          names = ["--rasp"],
+          description = ["whole: route the FindClass hook via KPM clone (traceless), RASP-safe"])
+      rasp: Boolean = false,
+      @Option(names = ["--dobby"], description = ["force pure Dobby (KPM not engaged)"])
+      dobby: Boolean = false,
+      @Option(names = ["--extout"], description = ["write dumps to the app EXTERNAL dir"])
+      extout: Boolean = false,
+      @Option(names = ["--no-extout"], description = ["write dumps to the app INTERNAL dir"])
+      noExtout: Boolean = false,
+      @Option(names = ["--interp-ms"], paramLabel = "N", description = ["interp capture window (ms)"])
+      interpMs: Int = 0,
+      @Option(
+          names = ["--worker-delay"],
+          paramLabel = "N",
+          description = ["sleep before the worker's first ART touch (ms)"])
+      workerDelay: Int = 0,
+      @Option(
+          names = ["--predelay"],
+          paramLabel = "N",
+          description = ["dexfind: wait before the FindClass hook (ms)"])
+      predelay: Int = 0
+  ): Int {
+    val opts = HashMap<String, Any>()
+    opts["rasp"] = rasp
+    opts["dobby"] = dobby
+    if (extout) opts["extout"] = "1"
+    if (noExtout) opts["extout"] = "0"
+    if (interpMs > 0) opts["interp_ms"] = interpMs.toString()
+    if (workerDelay > 0) opts["worker_delay_ms"] = workerDelay.toString()
+    if (predelay > 0) opts["predelay_ms"] = predelay.toString()
+    val req =
+        CliRequest(command = "unpack", action = "on", targets = listOf(preset, pkg), options = opts)
+    return OutputFormatter.print(VectorIPC.transmit(req), parent.json)
+  }
+
+  @Command(name = "off", description = ["Disarm (clear master + target + all tuning props)"])
+  fun off(): Int {
+    val req = CliRequest(command = "unpack", action = "off")
+    return OutputFormatter.print(VectorIPC.transmit(req), parent.json)
+  }
+
+  @Command(name = "status", description = ["Show the current unpacker prop state"])
+  fun status(): Int {
+    val req = CliRequest(command = "unpack", action = "status")
+    return OutputFormatter.print(VectorIPC.transmit(req), parent.json)
+  }
+
+  @Command(
+      name = "raw",
+      description = ["Set/delete persist.kpmhook.unpack.<key> (omit value = delete)"])
+  fun raw(
+      @Parameters(index = "0", paramLabel = "KEY") key: String,
+      @Parameters(index = "1", paramLabel = "VALUE", arity = "0..1") value: String?
+  ): Int {
+    val targets = if (value == null) listOf(key) else listOf(key, value)
+    val req = CliRequest(command = "unpack", action = "raw", targets = targets)
     return OutputFormatter.print(VectorIPC.transmit(req), parent.json)
   }
 }

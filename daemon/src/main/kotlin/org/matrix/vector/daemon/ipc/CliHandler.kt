@@ -11,6 +11,7 @@ import org.matrix.vector.daemon.data.ConfigCache
 import org.matrix.vector.daemon.data.ModuleDatabase
 import org.matrix.vector.daemon.data.PreferenceStore
 import org.matrix.vector.daemon.system.*
+import org.matrix.vector.daemon.unpack.UnpackConfig
 
 object CliHandler {
 
@@ -28,6 +29,7 @@ object CliHandler {
             "config" -> handleConfig(request)
             "db" -> handleDatabase(request)
             "log" -> handleLog(request)
+            "unpack" -> handleUnpack(request)
             else -> throw IllegalArgumentException("Unknown command: ${request.command}")
           }
       CliResponse(success = true, data = responseData)
@@ -264,6 +266,57 @@ object CliHandler {
       }
       // "stream" is handled in SystemServerService.kt to attach the FileDescriptor
       else -> throw IllegalArgumentException("Unknown log action: ${request.action}")
+    }
+  }
+
+  /**
+   * `vector unpack on|off|status|raw` -- friendly front-end over the stealth-unpacker
+   * persist.kpmhook.unpack.* prop contract. Delegates the recipe/validation to
+   * [UnpackConfig] (the single source of truth shared with tools/vunpack and, later, the
+   * manager UI). Writes props via resetprop; the native unpacker is untouched.
+   */
+  private fun handleUnpack(request: CliRequest): Any {
+    return when (request.action) {
+      "on" -> {
+        val preset =
+            request.targets.getOrNull(0)
+                ?: throw IllegalArgumentException(
+                    "usage: unpack on <${UnpackConfig.PRESETS.joinToString("|")}> <pkg> [opts]")
+        val pkg =
+            request.targets.getOrNull(1)
+                ?: throw IllegalArgumentException("package name required: unpack on $preset <pkg>")
+        val opts =
+            UnpackConfig.Opts(
+                rasp = request.options["rasp"] as? Boolean ?: false,
+                dobby = request.options["dobby"] as? Boolean ?: false,
+                extout = request.options["extout"] as? String,
+                interpMs = request.options["interp_ms"] as? String,
+                workerDelay = request.options["worker_delay_ms"] as? String,
+                predelay = request.options["predelay_ms"] as? String)
+        val r = UnpackConfig.arm(preset, pkg, opts)
+        val out = LinkedHashMap<String, Any>()
+        out["Armed"] = "${r.preset}  (target=${r.target})"
+        out["Dumps"] = r.dumpDir
+        if (r.warnings.isNotEmpty()) out["Warnings"] = r.warnings
+        out["Reminder"] = "props are persist. -> run 'vector unpack off' when done"
+        UnpackConfig.status().forEach { (k, v) -> out[k] = v }
+        out
+      }
+      "off" -> {
+        UnpackConfig.disarm()
+        "Disarmed: master + target + all tuning props cleared."
+      }
+      "status" -> UnpackConfig.status()
+      "raw" -> {
+        val key =
+            request.targets.getOrNull(0)
+                ?: throw IllegalArgumentException("usage: unpack raw <key> [value]")
+        val value = request.targets.getOrNull(1)
+        UnpackConfig.raw(key, value)
+        if (value == null) "Deleted persist.kpmhook.unpack.$key"
+        else "Set persist.kpmhook.unpack.$key = $value"
+      }
+      else -> throw IllegalArgumentException("Unknown unpack action: ${request.action}")
     }
   }
 }

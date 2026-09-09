@@ -33,6 +33,7 @@ import org.matrix.vector.daemon.data.ModuleDatabase
 import org.matrix.vector.daemon.data.PreferenceStore
 import org.matrix.vector.daemon.env.Dex2OatServer
 import org.matrix.vector.daemon.env.LogcatMonitor
+import org.matrix.vector.daemon.unpack.UnpackConfig
 import org.matrix.vector.daemon.system.*
 import org.matrix.vector.daemon.utils.PackageOptimizer
 import org.matrix.vector.daemon.utils.applyXspaceWorkaround
@@ -439,4 +440,43 @@ object ManagerService : ILSPManagerService.Stub() {
       ModuleDatabase.setAutoInclude(packageName, enabled)
 
   override fun getAutoInclude(packageName: String) = ConfigCache.getAutoInclude(packageName)
+
+  // --- stealth unpacker: delegate to the shared UnpackConfig contract ----------
+
+  private fun unpackStatusText(): String =
+      UnpackConfig.status().entries.joinToString("\n") { "${it.key} = ${it.value}" }
+
+  override fun armUnpack(preset: String, pkg: String, options: Bundle): Bundle {
+    val out = Bundle()
+    try {
+      val opts =
+          UnpackConfig.Opts(
+              rasp = options.getBoolean("rasp", false),
+              dobby = options.getBoolean("dobby", false),
+              extout = options.getString("extout"),
+              interpMs = options.getString("interp_ms"),
+              workerDelay = options.getString("worker_delay_ms"),
+              predelay = options.getString("predelay_ms"))
+      val r = UnpackConfig.arm(preset, pkg, opts)
+      val sb = StringBuilder()
+      sb.append("Armed: ${r.preset}  (target=${r.target})\n")
+      sb.append("Dumps: ${r.dumpDir}\n")
+      if (r.warnings.isNotEmpty()) {
+        sb.append("Warnings:\n")
+        r.warnings.forEach { sb.append("  - $it\n") }
+      }
+      sb.append("\n").append(unpackStatusText())
+      out.putBoolean("ok", true)
+      out.putString("summary", sb.toString())
+    } catch (e: Exception) {
+      Log.w(TAG, "armUnpack failed", e)
+      out.putBoolean("ok", false)
+      out.putString("error", e.message ?: "unknown error")
+    }
+    return out
+  }
+
+  override fun disarmUnpack() = UnpackConfig.disarm()
+
+  override fun getUnpackStatus(): String = unpackStatusText()
 }

@@ -79,4 +79,12 @@ interface ILSPManagerService {
     boolean getAutoInclude(String packageName) = 51;
 
     boolean setAutoInclude(String packageName, boolean enable) = 52;
+
+    // --- stealth unpacker (persist.kpmhook.unpack.* preset front-end) ---
+    // armUnpack returns a Bundle: ok(boolean), summary(String), error(String).
+    Bundle armUnpack(String preset, String pkg, in Bundle options) = 60;
+
+    void disarmUnpack() = 61;
+
+    String getUnpackStatus() = 62;
 }

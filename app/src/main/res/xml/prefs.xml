@@ -105,6 +105,13 @@
             android:shouldDisableView="false"
             android:summary="@string/settings_enable_status_notification_summary"
             android:title="@string/settings_enable_status_notification" />
+
+        <Preference
+            android:icon="@drawable/ic_outline_merge_type_24"
+            android:key="unpack_tool"
+            android:persistent="false"
+            android:summary="@string/unpack_entry_summary"
+            android:title="@string/unpack_title" />
     </PreferenceCategory>
 
     <PreferenceCategory android:title="@string/settings_group_repo">

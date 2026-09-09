@@ -1,0 +1,286 @@
+#!/system/bin/sh
+# vunpack -- on-device front-end for the Vector stealth unpacker prop contract.
+#
+# The unpacker (native/src/unpack) is driven ENTIRELY by persist.kpmhook.unpack.*
+# properties, set with resetprop. That contract is a stable ABI (see
+# native/src/unpack/README.md) but there are ~20 interacting props and several
+# mutual-exclusion rules that are easy to get wrong by hand. This script encodes
+# the README recipes as named presets, validates the combinations, and writes the
+# props coherently -- the native side is untouched.
+#
+# The same recipe->prop mapping is the canonical contract the Vector manager UI
+# (daemon) reuses; keep the PRESET_* tables here authoritative.
+#
+#   vunpack on <preset> <pkg> [opts]   arm a preset for <pkg>
+#   vunpack off                        disarm (clear master + all tuning props)
+#   vunpack status                     show the current prop state
+#   vunpack log [seconds]              tail logcat for unpacker progress (default 60s)
+#   vunpack raw <key> <value>          escape hatch: set persist.kpmhook.unpack.<key>
+#
+# Presets (see README "Recipe" sections):
+#   whole    whole-dex encryption shell (Bangcle/SecNeo/百度加固/Yidun) -> dexfind
+#   extract  method-extraction shell that self-patches libart (51job s.h.e.l.l)
+#   dpt      per-class DefineClass-restore shell (dpt-shell) -> interp + activeload
+#   fart     FART-style interpreter capture only (side-cache shells)
+#
+# Options (override preset defaults):
+#   --rasp             (whole) route the dexfind FindClass hook via KPM clone
+#                      (traceless=1) -- for apps that RASP-scan libart
+#   --dobby            force pure Dobby (stealth=0 traceless=0); KPM not engaged
+#   --extout / --no-extout   write dumps to the app EXTERNAL dir (default: preset)
+#   --interp-ms <N>    interp capture window (dpt/fart; default 30000)
+#   --worker-delay <N> sleep before the worker's first ART touch (default: preset)
+#   --predelay <N>     dexfind: wait before the FindClass hook (default 6000)
+#
+# Root required. resetprop is auto-detected (APatch / Magisk / KernelSU / PATH).
+
+set -u
+SELF="vunpack"
+
+# ---- prop namespace -----------------------------------------------------------
+NS="persist.kpmhook.unpack"          # tuning props live under NS.<key>
+P_MASTER="persist.kpmhook.unpack"    # master enable
+P_TARGET="persist.kpmhook.target"    # process nice-name gate (separate namespace)
+
+# Every tuning prop this script may set -- cleared on `off` so a stale flag from a
+# previous preset can never leak into the next run. Keep in sync with
+# ReadConfigFromProps() + the PropInt reads in unpacker.cpp WorkerMain.
+TUNING="stealth traceless dexfind trigger interp activeload extout \
+        interp_ms worker_delay_ms predelay_ms rounds interval_ms \
+        tier choke openat openat_ms openat_dobby"
+
+# ---- resetprop / root ---------------------------------------------------------
+die() { echo "[$SELF] error: $*" >&2; exit 1; }
+warn() { echo "[$SELF] warn: $*" >&2; }
+info() { echo "[$SELF] $*"; }
+
+find_resetprop() {
+  for c in /data/adb/ap/bin/resetprop /data/adb/magisk/resetprop \
+           /data/adb/ksu/bin/resetprop; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  command -v resetprop >/dev/null 2>&1 && { echo resetprop; return 0; }
+  return 1
+}
+
+[ "$(id -u 2>/dev/null)" = 0 ] || die "must run as root (e.g. 'su -c $SELF ...')"
+RP="$(find_resetprop)" || die "resetprop not found (APatch/Magisk/KernelSU)"
+
+sp() {  # set prop
+  # Plain set: writes the in-memory property area (what __system_property_get
+  # reads at app start) AND persists to /data (persist. namespace). No `-n`: these
+  # are persist. props and the persistence is what makes the 'off' reminder true.
+  # persist.kpmhook.* is a custom namespace with no `on property:` init rule bound,
+  # so a plain set restarts nothing.
+  "$RP" "$1" "$2" >/dev/null 2>&1
+}
+dp() { "$RP" --delete "$1" >/dev/null 2>&1; }   # delete prop
+gp() { getprop "$1"; }
+
+set_t() { sp "$NS.$1" "$2"; }   # set a tuning prop NS.<key>
+del_t() { dp "$NS.$1"; }
+
+clear_all() {
+  dp "$P_MASTER"
+  dp "$P_TARGET"
+  for k in $TUNING; do dp "$NS.$k"; done
+}
+
+# ---- option parsing (shared by presets) ---------------------------------------
+OPT_RASP=0 OPT_DOBBY=0 OPT_EXTOUT="" OPT_INTERP_MS="" OPT_WORKER_DELAY="" OPT_PREDELAY=""
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rasp) OPT_RASP=1 ;;
+      --dobby) OPT_DOBBY=1 ;;
+      --extout) OPT_EXTOUT=1 ;;
+      --no-extout) OPT_EXTOUT=0 ;;
+      --interp-ms) shift; OPT_INTERP_MS="${1:-}"; [ -n "$OPT_INTERP_MS" ] || die "--interp-ms needs a value" ;;
+      --worker-delay) shift; OPT_WORKER_DELAY="${1:-}"; [ -n "$OPT_WORKER_DELAY" ] || die "--worker-delay needs a value" ;;
+      --predelay) shift; OPT_PREDELAY="${1:-}"; [ -n "$OPT_PREDELAY" ] || die "--predelay needs a value" ;;
+      --*) die "unknown option: $1" ;;
+      *) die "unexpected argument: $1" ;;
+    esac
+    shift
+  done
+}
+
+# ---- presets ------------------------------------------------------------------
+# Each preset sets a clean baseline: master on, target set, all tuning props
+# cleared, then only the props the recipe needs. `off`/`on` always start from a
+# cleared state so nothing leaks between presets.
+
+arm_common() {
+  pkg="$1"
+  clear_all
+  sp "$P_MASTER" 1
+  sp "$P_TARGET" "$pkg"
+}
+
+apply_shared_opts() {
+  # --dobby forces pure Dobby (overrides any traceless the preset set).
+  if [ "$OPT_DOBBY" = 1 ]; then set_t stealth 0; set_t traceless 0; fi
+  [ -n "$OPT_EXTOUT" ] && set_t extout "$OPT_EXTOUT"
+  [ -n "$OPT_INTERP_MS" ] && set_t interp_ms "$OPT_INTERP_MS"
+  [ -n "$OPT_WORKER_DELAY" ] && set_t worker_delay_ms "$OPT_WORKER_DELAY"
+  [ -n "$OPT_PREDELAY" ] && set_t predelay_ms "$OPT_PREDELAY"
+}
+
+preset_whole() {   # whole-dex encryption shell
+  arm_common "$1"
+  set_t dexfind 1
+  # --rasp: the FindClass hook goes via KPM clone (RASP-safe) instead of Dobby.
+  [ "$OPT_RASP" = 1 ] && set_t traceless 1
+  apply_shared_opts
+  DESC="whole-dex (dexfind$([ "$OPT_RASP" = 1 ] && echo '+traceless'))"
+}
+
+preset_extract() {   # method-extraction shell that self-patches libart (51job)
+  arm_common "$1"
+  # pure Dobby -> KPM NOT engaged (avoids PTE collision with the shell's own
+  # private libart patching), + per-method CodeItem restore, + settle delay.
+  set_t stealth 0
+  set_t traceless 0
+  set_t dexfind 1
+  set_t trigger 1
+  set_t worker_delay_ms "${OPT_WORKER_DELAY:-12000}"
+  set_t extout "${OPT_EXTOUT:-1}"
+  # apply the remaining shared opts (interp-ms/predelay); don't re-apply the ones
+  # already defaulted above via ${OPT_...:-default}.
+  [ -n "$OPT_INTERP_MS" ] && set_t interp_ms "$OPT_INTERP_MS"
+  [ -n "$OPT_PREDELAY" ] && set_t predelay_ms "$OPT_PREDELAY"
+  DESC="extract/self-libart (dexfind+trigger, pure-Dobby, worker_delay)"
+}
+
+preset_dpt() {   # per-class DefineClass-restore shell (dpt-shell)
+  arm_common "$1"
+  set_t interp 1        # capture real CodeItems at the interpreter point
+  set_t activeload 1    # Class.forName every class so DefineClass-restore fires
+  set_t extout "${OPT_EXTOUT:-1}"
+  [ -n "$OPT_INTERP_MS" ] && set_t interp_ms "$OPT_INTERP_MS"
+  apply_shared_opts
+  DESC="dpt (interp+activeload)"
+}
+
+preset_fart() {   # FART-style interpreter capture only
+  arm_common "$1"
+  set_t interp 1
+  set_t extout "${OPT_EXTOUT:-1}"
+  [ -n "$OPT_INTERP_MS" ] && set_t interp_ms "$OPT_INTERP_MS"
+  apply_shared_opts
+  DESC="fart (interp only)"
+}
+
+# ---- validation ---------------------------------------------------------------
+# Re-read the props we just set and flag the mutual-exclusion hazards the native
+# side documents. These are advisory (native fails safe) but catch footguns.
+validate() {
+  dexfind=$(gp "$NS.dexfind"); interp=$(gp "$NS.interp"); activeload=$(gp "$NS.activeload")
+  trigger=$(gp "$NS.trigger"); stealth=$(gp "$NS.stealth"); traceless=$(gp "$NS.traceless")
+
+  # trigger needs dexfind (README: per-method GetCodeItem restore walks dexfind's dexes)
+  if [ "$trigger" = 1 ] && [ "$dexfind" != 1 ]; then
+    warn "trigger=1 but dexfind!=1 -> auto-enabling dexfind (trigger has no dexes otherwise)"
+    set_t dexfind 1
+  fi
+  # KPM engagement gate: stealth||traceless engage the KPM, which PTE-manages the
+  # target's libart pages -> collides with shells that patch libart themselves.
+  if { [ "$stealth" = 1 ] || [ "$traceless" = 1 ]; } && [ -n "$(gp "$NS.worker_delay_ms")" ] \
+     && [ "$(gp "$NS.worker_delay_ms")" -gt 0 ] 2>/dev/null; then
+    warn "KPM engaged (stealth/traceless) AND worker_delay set -- if this is a self-libart-patching shell, use --dobby instead (KPM PTE-manage collides with the shell's libart writes)"
+  fi
+}
+
+# ---- commands -----------------------------------------------------------------
+cmd_on() {
+  preset="${1:-}"; pkg="${2:-}"
+  [ -n "$preset" ] || die "usage: $SELF on <whole|extract|dpt|fart> <pkg> [opts]"
+  [ -n "$pkg" ] || die "package name required: $SELF on $preset <pkg>"
+  shift 2 2>/dev/null || shift $#
+  parse_opts "$@"
+  case "$preset" in
+    whole)   preset_whole   "$pkg" ;;
+    extract) preset_extract "$pkg" ;;
+    dpt)     preset_dpt     "$pkg" ;;
+    fart)    preset_fart    "$pkg" ;;
+    *) die "unknown preset '$preset' (want: whole|extract|dpt|fart)" ;;
+  esac
+  validate
+  info "armed: $DESC  target=$pkg"
+  info "dumps land in: $([ "$(gp "$NS.extout")" = 1 ] && echo "/storage/emulated/0/Android/data/$pkg/files/vunpack (extout)" || echo "/data/user/0/$pkg/unpack")"
+  info "now (re)launch the app; watch progress with: $SELF log"
+  info "REMEMBER: props are persist. -> run '$SELF off' when done (survives reboot)"
+  cmd_status
+}
+
+cmd_off() {
+  clear_all
+  info "disarmed: master/target cleared, all tuning props deleted"
+}
+
+cmd_status() {
+  m=$(gp "$P_MASTER"); t=$(gp "$P_TARGET")
+  echo "  $P_MASTER = ${m:-<unset>}"
+  echo "  $P_TARGET = ${t:-<unset>}"
+  any=0
+  for k in $TUNING; do
+    v=$(gp "$NS.$k")
+    [ -n "$v" ] && { echo "  $NS.$k = $v"; any=1; }
+  done
+  [ "$any" = 0 ] && echo "  (no tuning props set)"
+  # separate flags that also affect a run but live outside NS
+  for k in persist.kpmhook.fshide persist.kpmhook.fc persist.kpmhook.unpack.gcashfix; do
+    v=$(gp "$k"); [ -n "$v" ] && echo "  $k = $v  (external to preset)"
+  done
+}
+
+cmd_log() {
+  secs="${1:-60}"
+  info "tailing logcat for [unpack]/[gcashfix] for ${secs}s (Ctrl-C to stop)..."
+  # timeout bounds logcat so the script returns; grep filters to unpacker lines.
+  # (no --line-buffered: toybox grep may lack it; output flushes on EOF anyway.)
+  timeout "$secs" logcat -v time 2>/dev/null | grep -E '\[unpack\]|\[gcashfix\]|\[openat\]' \
+    || true
+}
+
+cmd_raw() {
+  k="${1:-}"; v="${2:-}"
+  [ -n "$k" ] || die "usage: $SELF raw <key> <value>   (sets $NS.<key>)"
+  if [ -z "$v" ]; then del_t "$k"; info "deleted $NS.$k"; else set_t "$k" "$v"; info "set $NS.$k = $v"; fi
+}
+
+usage() {
+  cat >&2 <<EOF
+$SELF -- Vector stealth-unpacker prop front-end
+
+  $SELF on <preset> <pkg> [opts]   arm a preset
+  $SELF off                        disarm (clear everything)
+  $SELF status                     show current prop state
+  $SELF log [seconds]              tail unpacker logcat (default 60)
+  $SELF raw <key> [value]          set/delete $NS.<key> (omit value = delete)
+
+presets: whole | extract | dpt | fart
+opts:    --rasp --dobby --extout/--no-extout --interp-ms N --worker-delay N --predelay N
+
+examples:
+  $SELF on whole com.some.app           # decrypt whole-dex shell
+  $SELF on whole com.some.app --rasp    # + KPM-clone FindClass hook (RASP-safe)
+  $SELF on extract com.job.android      # 51job-style self-libart-patching shell
+  $SELF on fart com.some.app --interp-ms 45000
+  $SELF status
+  $SELF off
+EOF
+  exit 2
+}
+
+# ---- dispatch -----------------------------------------------------------------
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+case "$cmd" in
+  on)     cmd_on "$@" ;;
+  off)    cmd_off ;;
+  status|st) cmd_status ;;
+  log)    cmd_log "$@" ;;
+  raw)    cmd_raw "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command '$cmd' (try: $SELF --help)" ;;
+esac

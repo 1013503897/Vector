@@ -239,4 +239,32 @@
     <string name="color_deep_orange">Deep orange</string>
     <string name="color_brown">Brown</string>
     <string name="color_blue_grey">Blue grey</string>
+
+    <!-- Stealth unpacker -->
+    <string name="unpack_title">Unpacker</string>
+    <string name="unpack_entry_summary">Arm the stealth DEX unpacker for a packed app</string>
+    <string name="unpack_group_target">Target</string>
+    <string name="unpack_group_options">Options (override preset defaults)</string>
+    <string name="unpack_group_action">Actions</string>
+    <string name="unpack_target">Target package</string>
+    <string name="unpack_preset">Preset</string>
+    <string name="unpack_rasp">RASP-safe (traceless)</string>
+    <string name="unpack_rasp_summary">whole: route the FindClass hook via KPM clone instead of Dobby</string>
+    <string name="unpack_dobby">Force pure Dobby</string>
+    <string name="unpack_dobby_summary">Do not engage the KPM (for shells that patch libart themselves)</string>
+    <string name="unpack_extout">Dump location</string>
+    <string name="unpack_interp_ms">Interp capture window (ms)</string>
+    <string name="unpack_interp_ms_summary">dpt/fart: how long to capture at the interpreter point (default 30000)</string>
+    <string name="unpack_worker_delay">Worker settle delay (ms)</string>
+    <string name="unpack_worker_delay_summary">Sleep before the first ART touch (self-libart-patching shells)</string>
+    <string name="unpack_arm">Arm</string>
+    <string name="unpack_arm_summary">Write the preset props; the unpacker runs on the next launch of the target</string>
+    <string name="unpack_disarm">Disarm</string>
+    <string name="unpack_disarm_summary">Clear the master switch, target, and all tuning props</string>
+    <string name="unpack_status">Current state</string>
+    <string name="unpack_status_empty">Nothing armed</string>
+    <string name="unpack_need_target">Enter a target package first</string>
+    <string name="unpack_armed">Armed — relaunch the target app</string>
+    <string name="unpack_failed">Failed to arm (see status)</string>
+    <string name="unpack_disarmed">Disarmed</string>
 </resources>

@@ -23,6 +23,7 @@ import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.util.Log;
@@ -342,6 +343,39 @@ public class ConfigManager {
         } catch (RemoteException e) {
             Log.e(App.TAG, Log.getStackTraceString(e));
             return false;
+        }
+    }
+
+    // --- stealth unpacker (persist.kpmhook.unpack.* preset front-end) ---
+
+    public static Bundle armUnpack(String preset, String pkg, Bundle options) {
+        try {
+            return LSPManagerServiceHolder.getService().armUnpack(preset, pkg, options);
+        } catch (RemoteException e) {
+            Log.e(App.TAG, Log.getStackTraceString(e));
+            Bundle b = new Bundle();
+            b.putBoolean("ok", false);
+            b.putString("error", e.getMessage());
+            return b;
+        }
+    }
+
+    public static boolean disarmUnpack() {
+        try {
+            LSPManagerServiceHolder.getService().disarmUnpack();
+            return true;
+        } catch (RemoteException e) {
+            Log.e(App.TAG, Log.getStackTraceString(e));
+            return false;
+        }
+    }
+
+    public static String getUnpackStatus() {
+        try {
+            return LSPManagerServiceHolder.getService().getUnpackStatus();
+        } catch (RemoteException e) {
+            Log.e(App.TAG, Log.getStackTraceString(e));
+            return null;
         }
     }
 }
