@@ -87,4 +87,13 @@ interface ILSPManagerService {
     void disarmUnpack() = 61;
 
     String getUnpackStatus() = 62;
+
+    // --- KPM traceless-hook target (persist.kpmhook.target + l2/fc) ---
+    // Sets the single KPM target process: engage the backend in `pkg` and route its Java-method
+    // hooks through the SSOL traceless path. `convert` also upgrades the early in-place hooks.
+    void setTracelessTarget(String pkg, boolean convert) = 63;
+
+    void clearTracelessTarget() = 64;
+
+    String getTracelessTarget() = 65;
 }

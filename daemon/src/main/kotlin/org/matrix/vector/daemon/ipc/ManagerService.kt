@@ -479,4 +479,13 @@ object ManagerService : ILSPManagerService.Stub() {
   override fun disarmUnpack() = UnpackConfig.disarm()
 
   override fun getUnpackStatus(): String = unpackStatusText()
+
+  // --- KPM traceless-hook target ------------------------------------------------
+
+  override fun setTracelessTarget(pkg: String, convert: Boolean) =
+      UnpackConfig.setTracelessTarget(pkg, convert)
+
+  override fun clearTracelessTarget() = UnpackConfig.clearTracelessTarget()
+
+  override fun getTracelessTarget(): String = UnpackConfig.tracelessTarget()
 }

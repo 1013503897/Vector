@@ -193,6 +193,34 @@ object UnpackConfig {
     if (value == null) delProp("$NS.$key") else setT(key, value)
   }
 
+  // ---- KPM traceless-hook target (shares the single `persist.kpmhook.target` slot) ------------
+  // Independent of the unpack presets: this is the "which process gets the KPM backend + SSOL
+  // traceless Java-hook path" knob. NB: single-slot -- setting a traceless target replaces any
+  // previous target, and an unpack arm()/disarm() also writes/clears the same TARGET prop.
+
+  private const val L2 = "persist.kpmhook.l2" // route Java hooks through SSOL (traceless) in target
+  private const val FC = "persist.kpmhook.fc" // post-init convert of early in-place hooks -> traceless
+
+  /** Arm [pkg] as the KPM traceless target: engage the backend there and turn on the SSOL path.
+   *  [convert]=true also upgrades the hooks installed before init. Takes effect on the target's
+   *  next spawn (proc_is_target reads the prop live) -- no reboot/daemon-reload needed. */
+  fun setTracelessTarget(pkg: String, convert: Boolean = true) {
+    if (pkg.isBlank()) throw IllegalArgumentException("package name required")
+    setProp(TARGET, pkg)
+    setProp(L2, "1")
+    if (convert) setProp(FC, "1") else delProp(FC)
+  }
+
+  /** Clear the traceless target and its engagement flags. */
+  fun clearTracelessTarget() {
+    delProp(TARGET)
+    delProp(L2)
+    delProp(FC)
+  }
+
+  /** Current KPM target process name (empty when unset). */
+  fun tracelessTarget(): String = getProp(TARGET)
+
   /** Current prop state: master, target, any set tuning props, and the external flags. */
   fun status(): LinkedHashMap<String, String> {
     val m = LinkedHashMap<String, String>()

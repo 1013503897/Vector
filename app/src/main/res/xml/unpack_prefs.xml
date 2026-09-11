@@ -100,4 +100,43 @@
             android:summary="@string/unpack_status_empty"
             android:title="@string/unpack_status" />
     </PreferenceCategory>
+
+    <PreferenceCategory android:title="无痕 Hook 目标 (KPM traceless)">
+
+        <EditTextPreference
+            android:dialogTitle="KPM 无痕 hook 目标包名"
+            android:icon="@drawable/ic_outline_android_24"
+            android:key="traceless_target"
+            android:title="目标应用包名"
+            app:useSimpleSummaryProvider="true" />
+
+        <rikka.material.preference.MaterialSwitchPreference
+            android:defaultValue="true"
+            android:icon="@drawable/ic_outline_invert_colors_24"
+            android:key="traceless_convert"
+            android:summaryOff="仅新 hook 走无痕，不转换启动前的 in-place hook"
+            android:summaryOn="启动前的 in-place hook 也转成无痕 (fc=1)"
+            android:title="转换启动前 hook (fc)" />
+
+        <Preference
+            android:icon="@drawable/ic_outline_speaker_notes_24"
+            android:key="traceless_set"
+            android:persistent="false"
+            android:summary="写 persist.kpmhook.target/l2(+fc)，重启目标 app 生效"
+            android:title="设为无痕 target" />
+
+        <Preference
+            android:icon="@drawable/ic_outline_restore_24"
+            android:key="traceless_clear"
+            android:persistent="false"
+            android:summary="清除 target/l2/fc"
+            android:title="清除无痕 target" />
+
+        <Preference
+            android:icon="@drawable/ic_baseline_info_24"
+            android:key="traceless_status"
+            android:persistent="false"
+            android:summary="点击查看当前 target"
+            android:title="当前无痕 target" />
+    </PreferenceCategory>
 </PreferenceScreen>

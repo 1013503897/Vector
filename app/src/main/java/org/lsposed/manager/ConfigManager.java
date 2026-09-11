@@ -378,4 +378,35 @@ public class ConfigManager {
             return null;
         }
     }
+
+    // --- KPM traceless-hook target (persist.kpmhook.target + l2/fc) ---
+
+    public static boolean setTracelessTarget(String pkg, boolean convert) {
+        try {
+            LSPManagerServiceHolder.getService().setTracelessTarget(pkg, convert);
+            return true;
+        } catch (RemoteException e) {
+            Log.e(App.TAG, Log.getStackTraceString(e));
+            return false;
+        }
+    }
+
+    public static boolean clearTracelessTarget() {
+        try {
+            LSPManagerServiceHolder.getService().clearTracelessTarget();
+            return true;
+        } catch (RemoteException e) {
+            Log.e(App.TAG, Log.getStackTraceString(e));
+            return false;
+        }
+    }
+
+    public static String getTracelessTarget() {
+        try {
+            return LSPManagerServiceHolder.getService().getTracelessTarget();
+        } catch (RemoteException e) {
+            Log.e(App.TAG, Log.getStackTraceString(e));
+            return null;
+        }
+    }
 }

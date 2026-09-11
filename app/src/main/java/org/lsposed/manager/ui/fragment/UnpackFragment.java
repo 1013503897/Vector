@@ -109,7 +109,36 @@ public class UnpackFragment extends BaseFragment {
                 });
             }
 
-            if (installed) refreshStatus();
+            Preference tlSet = findPreference("traceless_set");
+            if (tlSet != null) {
+                tlSet.setEnabled(installed);
+                tlSet.setOnPreferenceClickListener(p -> {
+                    doSetTraceless();
+                    return true;
+                });
+            }
+
+            Preference tlClear = findPreference("traceless_clear");
+            if (tlClear != null) {
+                tlClear.setEnabled(installed);
+                tlClear.setOnPreferenceClickListener(p -> {
+                    doClearTraceless();
+                    return true;
+                });
+            }
+
+            Preference tlStatus = findPreference("traceless_status");
+            if (tlStatus != null) {
+                tlStatus.setOnPreferenceClickListener(p -> {
+                    refreshTracelessStatus();
+                    return true;
+                });
+            }
+
+            if (installed) {
+                refreshStatus();
+                refreshTracelessStatus();
+            }
         }
 
         // ---- helpers ----
@@ -193,6 +222,50 @@ public class UnpackFragment extends BaseFragment {
                 if (parentFragment == null) return;
                 parentFragment.runOnUiThread(() -> setStatusSummary(
                         st == null || st.isEmpty() ? getString(R.string.unpack_status_empty) : st));
+            });
+        }
+
+        // ---- KPM traceless-hook target ----
+
+        private void doSetTraceless() {
+            if (parentFragment == null) return;
+            String pkg = editText("traceless_target");
+            if (pkg.isEmpty()) {
+                parentFragment.showHint(R.string.unpack_need_target, true);
+                return;
+            }
+            boolean convert = switchOn("traceless_convert");
+            parentFragment.runAsync(() -> {
+                boolean ok = ConfigManager.setTracelessTarget(pkg, convert);
+                if (parentFragment == null) return;
+                parentFragment.runOnUiThread(() -> {
+                    refreshTracelessStatus();
+                    parentFragment.showHint(ok ? R.string.unpack_armed : R.string.unpack_failed, ok);
+                });
+            });
+        }
+
+        private void doClearTraceless() {
+            if (parentFragment == null) return;
+            parentFragment.runAsync(() -> {
+                ConfigManager.clearTracelessTarget();
+                if (parentFragment == null) return;
+                parentFragment.runOnUiThread(() -> {
+                    refreshTracelessStatus();
+                    parentFragment.showHint(R.string.unpack_disarmed, true);
+                });
+            });
+        }
+
+        private void refreshTracelessStatus() {
+            if (parentFragment == null) return;
+            parentFragment.runAsync(() -> {
+                String t = ConfigManager.getTracelessTarget();
+                if (parentFragment == null) return;
+                parentFragment.runOnUiThread(() -> {
+                    Preference st = findPreference("traceless_status");
+                    if (st != null) st.setSummary((t == null || t.isEmpty()) ? "未设置" : ("当前: " + t));
+                });
             });
         }
     }
