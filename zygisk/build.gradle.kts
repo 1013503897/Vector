@@ -1,3 +1,4 @@
+import java.io.File
 import java.security.MessageDigest
 import org.apache.commons.codec.binary.Hex
 import org.apache.tools.ant.filters.ReplaceTokens
@@ -129,15 +130,34 @@ androidComponents {
                         include("**/libzygisk.so")
                     }
                 }
-                into("bin") {
-                    from(
-                        project(":dex2oat")
-                            .layout
-                            .buildDirectory
-                            .dir("intermediates/cmake/$variantLowered/obj")
-                    ) {
-                        include("**/dex2oat")
-                        include("**/liboat_hook.so")
+                // AGP 8 writes the CMake outputs under cxx/<buildType>/<hash>/obj, an older layout
+                // used cmake/<variant>/obj. A Sync from a path that does not exist copies nothing
+                // at all and reports nothing, which is how this module silently shipped with no
+                // dex2oat and no liboat_hook.so; copying explicitly keeps a missing binary a
+                // visible no-op instead. Runs before the digest pass below so the hashes cover it.
+                doLast {
+                    val cmakeBuildType =
+                        if (variantLowered == "release") "RelWithDebInfo" else "Debug"
+                    val dex2oatBuildDir = project(":dex2oat").layout.buildDirectory.get().asFile
+                    val objDirs =
+                        listOfNotNull(
+                            File(dex2oatBuildDir, "intermediates/cmake/$variantLowered/obj"),
+                            File(dex2oatBuildDir, "intermediates/cxx/$cmakeBuildType")
+                                .listFiles()
+                                ?.firstOrNull()
+                                ?.resolve("obj"),
+                        )
+                    val binDir = File(tempModuleDir.get().asFile, "bin")
+                    for (abi in listOf("arm64-v8a", "armeabi-v7a", "x86", "x86_64")) {
+                        for (binary in listOf("dex2oat", "liboat_hook.so")) {
+                            val source =
+                                objDirs
+                                    .map { File(File(it, abi), binary) }
+                                    .firstOrNull { it.isFile } ?: continue
+                            val target = File(File(binDir, abi), binary)
+                            target.parentFile.mkdirs()
+                            source.copyTo(target, overwrite = true)
+                        }
                     }
                 }
                 val dexOutPath =
