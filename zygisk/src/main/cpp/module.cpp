@@ -57,6 +57,13 @@ static JavaVM *g_vm = nullptr;
 // DONE=finished (success or bail).
 enum { CONVERT_NONE = 0, CONVERT_RUNNING = 1, CONVERT_DONE = 2 };
 static std::atomic<int> g_convert_state{CONVERT_NONE};
+// Byte offset of `entry_point_from_quick_compiled_code_` in an ART ArtMethod, as resolved by
+// LSPlant from the runtime's own layout (lsplant::GetArtMethodEntryPointOffset(), never a
+// hardcoded constant). Filled in right after lsplant::Init and handed to the shared-stub router
+// (B.7.2), whose HIT path reads a replacement's entry point to enter it the way ART itself would,
+// instead of resuming the shared nterp stub with x0 rewritten -- see the block comment in
+// native/src/kpm/kpmhook.c. Read by the hooker callback below, which runs long after Init.
+static uint32_t g_art_entry_point_offset = 0;
 static void RecordHookedMethod(void *method) {
     int i = g_hooked_count;
     if (i < kMaxHookedMethods) {
@@ -65,47 +72,150 @@ static void RecordHookedMethod(void *method) {
     }
 }
 
-// May we KPM-trap `qc` (a Java method's quick-compiled entry) for L2? Two conditions:
-//  (1) qc is in a file-backed AOT region (boot.oat / app .odex). Excludes JIT (shared anon
-//      cache) and the libart interpreter bridge.
-//  (2) qc is a genuine per-method compiled body, NOT a SHARED boot.oat stub. Many framework
-//      methods aren't individually AOT-compiled and share an nterp/bridge stub that lives in
-//      boot.oat (so (1) alone passes!) -- trapping a shared stub reroutes EVERY method using
-//      it. A real dex2oat method has an OatQuickMethodHeader right before its code whose
-//      code_size is small/sane; a shared stub's qc-4 is an instruction word (huge when masked),
-//      so the code_size sanity check rejects it. Non-traceable methods fall back to in-place.
-static bool QcIsTraceable(const void *qc) {
+// ---- qc site classification (Phase B.7.3) ------------------------------------------------------
+//
+// WHERE does a method's quick-compiled entry (qc) live? That is the only question this classifier
+// asks, and the answer decides which backend may own the method.
+//
+// It used to ask a different one -- "is the word at qc-4 a sane OatQuickMethodHeader::code_size?" --
+// and that premise is NOT universally true. Measured on device: five methods that consequently fell
+// all the way through to the detectable in-place hook had their qc in
+// /system/framework/arm64/boot-framework.oat with qc-4 holding an INSTRUCTION word (0x97f3562e, a
+// BL encoding) or 0x00000000 -- not a size at all. A shared stub is by definition ONE address
+// shared by everyone who uses it; those five addresses are all different from each other and all
+// inside boot-framework.oat, so they are those methods' OWN AOT bodies, and the code_size test was
+// rejecting real bodies. The FILE a qc lives in is the reliable question: ART's shared stubs
+// (quick_to_interpreter_bridge, the resolution trampolines, nterp) are functions COMPILED INTO
+// libart.so, while a method's body lives in the .oat/.odex/.art file dex2oat wrote.
+//
+//   qc site                                meaning                          backend
+//   -------------------------------------  -------------------------------  -----------------------
+//   == nterp_entry_point                   ART's shared interpreter stub    router (B.7.2)
+//   == nterp_with_clinit_entry_point       same page; one W^X patch/page    refuse -> in-place
+//   executable, in libart.so               SHARED stub -- no exported       in-place ONLY: a patch
+//                                          symbol, so location is the only  on one reroutes EVERY
+//                                          way to recognise it               method that uses it
+//   executable, in .oat/.odex/.art         the method's OWN AOT body        R^X
+//   executable, ART's JIT code cache       own body, but a page ART keeps   in-place (B.7.0 guard)
+//                                          writing
+//   anything else (no VMA, non-executable, uncertain                        in-place + the reason
+//   maps unreadable, unrecognised file)                                     (fail closed)
+//
+// The two nterp rows use the RESOLVED SYMBOL VALUES (WxRouterSharedStubKind), never a location
+// guess -- red line 4. Everything else is file identity from /proc/self/maps. Nothing is inferred
+// from the bytes at qc-4 any more, and the JIT cache is recognised BEFORE libart/.oat so that a
+// path naming both can never be armed.
+//
+// THIS RULE IS A CONTRACT WITH native/src/kpm/kpmhook.c (wx_site_of, and the per-method arm gate in
+// kpm_wx_java_hooker that consumes it). The mirror there is deliberately a second, independent
+// implementation: it is the backstop that keeps a shared-stub address away from the kernel-adjacent
+// arm even if the decision made here is wrong. CHANGE THE TWO TOGETHER.
+enum class QcSite {
+    kUnknown,  // no VMA / not executable / maps unreadable / unrecognised file -> fail closed
+    kInterp,   // ART's shared interpreter entry (nterp or nterp_with_clinit)
+    kLibart,   // executable libart.so: a SHARED stub, never a per-method body
+    kOat,      // executable .oat/.odex/.art: the method's OWN file-backed AOT body
+    kJit,      // ART's JIT code cache: an own body, but never an R^X target (B.7.0)
+};
+
+// Classify `qc` by location. `*why` is set to a static reason string for EVERY answer (including
+// the permissive one), so a caller can report a refusal without re-deriving anything.
+static QcSite QcSiteOf(const void *qc, const char **why) {
+    const char *unused = nullptr;
+    if (!why) why = &unused;
     auto a = reinterpret_cast<uintptr_t>(qc);
-    if (a < 0x2000) return false;
+    if (a < 0x2000) {
+        *why = "not a plausible code address (null / below the first page)";
+        return QcSite::kUnknown;
+    }
+    // Red line 4: ART's two shared interpreter entries are identified by the values RESOLVED FROM
+    // ART'S SYMBOLS, never by where they happen to sit -- they live in libart.so and would
+    // otherwise be indistinguishable from any other shared stub there.
+    switch (vector::native::WxRouterSharedStubKind(const_cast<void *>(qc))) {
+        case 1:
+            *why = "qc == nterp_entry_point (ART's shared interpreter entry, resolved from ART's "
+                   "symbols): every interpreted method of the process enters here, so it belongs to "
+                   "the B.7.2 router, not to a per-method backend";
+            return QcSite::kInterp;
+        case 2:
+            *why = "qc == nterp_with_clinit_entry_point (ART's static-method interpreter entry, "
+                   "resolved from ART's symbols): it shares nterp_entry_point's page and the R^X "
+                   "backend allows one patch per page, so it cannot be routed either";
+            return QcSite::kInterp;
+        default:
+            break;
+    }
     FILE *f = fopen("/proc/self/maps", "re");
-    if (!f) return false;
-    char line[512];
-    bool in_oat = false, in_jit = false;
+    if (!f) {
+        *why = "/proc/self/maps unreadable: the file behind this address cannot be determined";
+        return QcSite::kUnknown;
+    }
+    char line[512], perms[8] = {0}, path[256] = {0};
+    uintptr_t lo = 0, hi = 0;
+    bool found = false;
     while (fgets(line, sizeof line, f)) {
-        uintptr_t lo = 0, hi = 0;
-        char perms[8] = {0}, path[256] = {0};
+        path[0] = '\0';
         if (sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path) >= 3 &&
             a >= lo && a < hi) {
-            if (perms[2] == 'x') {
-                in_oat = strstr(path, ".oat") || strstr(path, ".odex") || strstr(path, ".art") ||
-                         strstr(path, "/oat/");
-                in_jit = strstr(path, "jit-code-cache") || strstr(path, "jit-cache");
-            }
-            break;
+            found = true;
+            break;  // maps regions are disjoint and sorted: this is the only one that can describe a
         }
     }
     fclose(f);
-    if (!in_oat && !in_jit) return false;
-    // The JIT code-cache holds ONLY unique per-method compiled bodies -- shared nterp/bridge stubs
-    // live in libart.so / boot.oat, never here -- so any executable jit-cache address is a safe,
-    // unique trap target. (Also: for JIT code qc-4 is code_info_offset_, NOT code_size_, so the
-    // boot.oat code_size sanity check below would wrongly reject every JIT body.)
-    if (in_jit) return true;
-    // For .oat/.odex/.art, guard against the SHARED nterp stub many framework methods point at:
-    // a real per-method body has a sane OatQuickMethodHeader.code_size_ at qc-4; a shared stub's
-    // qc-4 is an instruction word (huge when masked), far above any real method.
-    uint32_t code_size = *reinterpret_cast<const uint32_t *>(a - 4) & 0x3FFFFFFFu;
-    return code_size >= 8 && code_size <= 0x80000;
+    if (!found) {
+        *why = "no /proc/self/maps region covers this address (a VMA-less ghost page -- e.g. one of "
+               "this module's own stubs -- is not a method body)";
+        return QcSite::kUnknown;
+    }
+    if (perms[2] != 'x') {
+        *why = "the covering mapping is not executable";
+        return QcSite::kUnknown;
+    }
+    if (strstr(path, "jit-code-cache") || strstr(path, "jit-cache")) {
+        *why = "the qc page is ART's JIT code cache, which ART keeps writing: an R^X shadow page is "
+               "a SNAPSHOT of it (stale bytes -> SIGILL, B.7.0 device-measured)";
+        return QcSite::kJit;
+    }
+    if (strstr(path, "libart")) {
+        *why = "the qc page is executable libart.so, where ART's SHARED stubs live "
+               "(quick_to_interpreter_bridge / resolution trampolines / nterp): they have no "
+               "per-method identity, so an R^X patch on this page would reroute every method that "
+               "uses the stub -- process-wide and irreversible";
+        return QcSite::kLibart;
+    }
+    if (strstr(path, ".oat") || strstr(path, ".odex") || strstr(path, ".art") ||
+        strstr(path, "/oat/")) {
+        *why = "the qc page is a file-backed .oat/.odex/.art mapping: the method's own AOT code";
+        return QcSite::kOat;
+    }
+    *why = "the qc page is executable but its file is neither libart.so nor a .oat/.odex/.art "
+           "mapping (in-memory dex / anonymous code)";
+    return QcSite::kUnknown;
+}
+
+// "Does this qc carry a compiled body OF ITS OWN?" -- the question the L2 clone backend, the
+// force-compile probe and the S3 detection probe ask. AOT and JIT bodies BOTH answer yes: the JIT
+// code cache holds one compiled body per method and never a shared stub. The R^X-specific
+// restriction (never arm a page ART keeps writing) is deliberately NOT imposed here -- the R^X call
+// sites ask QcIsRxArmable, and kpmhook.c's B.7.0 guard is the backstop for them.
+static bool QcHasOwnBody(const void *qc, const char **why) {
+    QcSite s = QcSiteOf(qc, why);
+    return s == QcSite::kOat || s == QcSite::kJit;
+}
+static bool QcIsTraceable(const void *qc) { return QcHasOwnBody(qc, nullptr); }
+
+// "May the R^X shadow backend arm a page over this qc?" -- ONLY a file-backed AOT body. libart.so
+// is where ART's shared stubs live and a patch there reroutes every user of the stub. EVERY refusal
+// logs its reason: the phase's coverage acceptance is counted from these lines, and an "in-place"
+// with no reason is not diagnosable. Fail closed (red line 3): never guess.
+static bool QcIsRxArmable(const void *qc) {
+    const char *why = nullptr;
+    QcSite s = QcSiteOf(qc, &why);
+    if (s == QcSite::kOat) return true;
+    LOGI("[wx] qc={} NOT R^X-armable -> in-place (red line: only a file-backed AOT body may be "
+         "patched). reason: {}",
+         qc, why);
+    return false;
 }
 
 // M-C: force the JIT to give an nterp/interpreted method its OWN compiled body, so the traceless
@@ -226,16 +336,29 @@ static void DetectionProbeScan() {
     // ---- surface #3: ArtMethod integrity. For each hooked method, the entry_point must point at
     // legit unique compiled code (oat/jit) and access_flags must not carry the hook's
     // kAccCompileDontBother. An in-place hook leaves entry==trampoline (not traceable) and the flag
-    // set -> DETECTED; a traceless hook leaves entry==real oat/jit code, flag clear -> CLEAN. ----
+    // set -> DETECTED; a traceless hook leaves entry==real oat/jit code, flag clear -> CLEAN.
+    // B.7.2: a SHARED-STUB-ROUTED method's entry is ART's own shared interpreter stub (nterp) --
+    // which is what ART sets for any method it has not compiled, so it is pristine, not a mutation.
+    // It is also a state no hook path can produce (every backend that writes the ArtMethod writes a
+    // trampoline/clone/stub there instead), so accepting it cannot mask a real in-place hook. ----
     constexpr uint32_t kAccCompileDontBother = 0x02000000u;
-    int hooked = g_hooked_count, s3_bad = 0;
+    int hooked = g_hooked_count, s3_bad = 0, s3_routed = 0;
     for (int i = 0; i < hooked && i < kMaxHookedMethods; i++) {
         void *m = g_hooked_methods[i];
         if (!m) continue;
         void *entry = *reinterpret_cast<void **>(reinterpret_cast<char *>(m) + 24);
         uint32_t flags = *reinterpret_cast<uint32_t *>(reinterpret_cast<char *>(m) + 4);
-        bool entry_ok = QcIsTraceable(entry);            // points at legit unique oat/jit body
+        // points at a legit unique oat/jit body, OR at ART's shared interpreter entry (a method the
+        // router took over: no compiled body exists to point at, and the router leaves it alone)
+        bool entry_ok = QcIsTraceable(entry) || vector::native::WxRouterOwnsSharedStub(entry);
         bool flags_ok = !(flags & kAccCompileDontBother);  // not marked non-compilable by a hook
+        if (entry_ok && !QcIsTraceable(entry)) {
+            s3_routed++;
+            if (s3_routed <= 6)
+                LOGI("[probe] S3 shared-stub-routed ArtMethod {}: entry={} is ART's shared "
+                     "interpreter stub (no per-method body exists) flags={:#x} -> pristine",
+                     m, entry, flags);
+        }
         if (!entry_ok || !flags_ok) {
             s3_bad++;
             if (s3_bad <= 6)
@@ -245,8 +368,9 @@ static void DetectionProbeScan() {
     }
 
     LOGI("[probe] ===== DETECTION PROBE ===== S2 anon-rx={} rwxp={}  S5 TracerPid={}  S1/4 "
-         "libart-patched-pages={}  S3 hooked={} mutated={}",
-         anon_rx, rwx, tracer_pid, code_diffs, hooked, s3_bad);
+         "libart-patched-pages={}  S3 hooked={} mutated={} (of which {} shared-stub-routed, "
+         "entry = ART's nterp stub by construction)",
+         anon_rx, rwx, tracer_pid, code_diffs, hooked, s3_bad, s3_routed);
     LOGI("[probe] VERDICT S2(maps/smaps)={} S5(ptrace)={} S1/4(code-CRC)={} S3(ArtMethod)={}",
          (anon_rx == 0 && rwx == 0) ? "CLEAN" : "DETECTED", tracer_pid == 0 ? "CLEAN" : "DETECTED",
          code_diffs == 0 ? "CLEAN" : (code_diffs < 0 ? "SKIP" : "DETECTED"),
@@ -269,36 +393,50 @@ static void RunDetectionProbe() {
 // Hide this process's anomalous anon EXECUTABLE regions from /proc/self/{maps,smaps} via the KPM.
 // Two signatures: rwxp anon (the LSPlant trampoline pool every hook creates) AND r-xp anon (the KPM
 // region clones, incl. any the auto-hide missed because a VMA merge moved its start). On a W^X
-// system nothing legit is anon+executable, so hiding every such region closes surface #2. We read
-// the POST-MERGE maps, so registering each VMA's start page hides the whole (possibly merged) VMA.
-// mm-gated in the KPM; only acts in the gated process. Safe to call repeatedly (hide-set dedups).
+// system nothing legit is anon+executable, so hiding such regions closes surface #2. The scan
+// itself lives in the native layer (kpm_hide_all_anon_exec) so it has ONE implementation shared
+// with the host. It hides ONE hide-set entry PER REGION (B.4): the KPM's filter matches an entry
+// against a VMA's vm_start, so a single registration covers a whole region. The old per-page walk
+// spent 315 entries on ART's single 1.29MB in-memory-dex code region and filled the KPM's 64-entry
+// set by itself, leaving the actual hook pools visible. That region is part of Vector's injected
+// footprint (ART compiles the framework dex Vector loads in memory), so hiding it is intended.
+// Budget now: on the order of the number of unnamed exec regions (a handful), not their pages.
+// mm-gated in the KPM; only acts in the gated process. Safe to call repeatedly (dedups, so a
+// repeat costs no new entry).
 static void HideRwxpRegionsScan() {
     if (kpm_hook_init() != 0) return;  // gated process + bridge armed only
-    FILE *f = fopen("/proc/self/maps", "re");
-    if (!f) return;
-    char line[512];
-    int hid = 0;
-    while (fgets(line, sizeof line, f)) {
-        uintptr_t lo = 0, hi = 0;
-        char perms[8] = {0}, path[256] = {0};
-        int n = sscanf(line, "%lx-%lx %7s %*x %*x:%*x %*u %255[^\n]", &lo, &hi, perms, path);
-        if (n < 3) continue;
-        bool exec = perms[2] == 'x';
-        bool anon = !(n >= 4 && path[0]);
-        if (exec && anon)
-            for (uintptr_t pg = lo; pg < hi; pg += 0x1000)
-                if (kpm_hide_region(reinterpret_cast<void *>(pg))) hid++;
-    }
-    fclose(f);
-    LOGI("[hidetramp] hid {} anon-exec pages (trampoline/clone) from maps/smaps", hid);
+    int hid = kpm_hide_all_anon_exec();
+    LOGI("[hidetramp] hid {} anon-exec region(s) (trampoline pool/in-memory-dex/clones) from "
+         "maps/smaps", hid);
 }
-static void RunTrampolineHide() {
-    char v[PROP_VALUE_MAX] = {0};
-    if (!kUseKpmBackend || __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1') return;
+// Gate: the maps-hide exists FOR the traceless backends, so engage it when EITHER is requested.
+// It used to key off l2 alone, which meant an operator who only wanted B.2 (wx) had to switch on
+// l2 as well -- and l2 also arms the legacy SSOL branch, which DoHook falls through to for any
+// method the wx backend refuses (a refusal wx makes can still pass SSOL's QcIsTraceable check, so
+// that fallthrough is the original SSOL crash). wx alone now gets the hiding, no l2 needed.
+// Returns true when hiding is engaged, so postAppSpecialize can also run the scan synchronously
+// after InitHooks() through the SAME gate (one gate, one pair of log lines).
+static bool RunTrampolineHide() {
+    char l2[PROP_VALUE_MAX] = {0}, wx[PROP_VALUE_MAX] = {0};
+    bool want_l2 = __system_property_get("persist.kpmhook.l2", l2) > 0 && l2[0] == '1';
+    bool want_wx = __system_property_get("persist.kpmhook.wx", wx) > 0 && wx[0] == '1';
+    if (!kUseKpmBackend || !(want_l2 || want_wx)) {
+        LOGI("[hidetramp] gate: l2={} wx={} kpm_backend={} -> hiding OFF", want_l2 ? 1 : 0,
+             want_wx ? 1 : 0, kUseKpmBackend ? 1 : 0);
+        return false;  // gated process + bridge armed only (HideRwxpRegionsScan re-checks anyway)
+    }
+    // The +5s delayed rescan stays as the backstop: the arm path closes the pool window in
+    // milliseconds, but regions minted LATER (a lazily-loaded dex, a late hook) would otherwise
+    // stay visible until the app's next self-check. It costs one entry per region now, so it is
+    // cheap; kpm_hide_all_anon_exec's dedup means a repeat finds nothing new to register.
+    LOGI("[hidetramp] gate: l2={} wx={} kpm_backend=1 -> hiding ON (per-region scan at arm time + "
+         "synchronously after InitHooks; +5s rescan as backstop)",
+         want_l2 ? 1 : 0, want_wx ? 1 : 0);
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::seconds(5));  // after startup hooks install
         HideRwxpRegionsScan();
     }).detach();
+    return true;
 }
 
 // M-C: post-init worker that upgrades the early in-place hooks to traceless (force-compile + KPM
@@ -505,20 +643,92 @@ private:
                     __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1')
                     return nullptr;
                 if (!QcIsTraceable(target)) {
-                    LOGI("[l2] qc={} not a traceable AOT body (interp/jit/shared stub) -> in-place",
-                         target);
+                    const char *why = nullptr;
+                    (void)QcHasOwnBody(target, &why);
+                    LOGI("[l2] qc={} not a traceable AOT body (no per-method body of its own) -> "
+                         "in-place. reason: {}",
+                         target, why);
                     return nullptr;
                 }
-                void *bk = kpm_ssol_hooker(target, replace);
-                LOGI("[l2] traceless Java hook (SSOL): qc={} -> trampoline {}, bk_va={} ({})", target,
-                     replace, bk, bk ? "TRACELESS" : "in-place fallback");
+                // xp_on_demo: use the VERIFIED region-clone backend (L1d/L1e: 6 simultaneous
+                // libart inline hooks through region clones, zero Dobby fallback, .text
+                // untouched) instead of the SSOL single-step backend. This is exactly the L2a
+                // design in docs/L2-java-traceless.md ("kpm_inline_hooker(M.GetEntryPoint(),
+                // trampoline) ... the KPM needs NO change for L2a"), and it returns the
+                // in-clone faithful copy as the call-original backup.
+                void *bk = kpm_inline_hooker(target, replace);
+                LOGI("[l2] traceless Java hook (REGION-CLONE): qc={} -> trampoline {}, bk={} ({})",
+                     target, replace, bk, bk ? "TRACELESS" : "in-place fallback");
                 return bk;
             },
         // Paired traceless un-hooker: disarm the SSOL trap by its qc. LSPlant uses this to follow
         // JIT-cache moves -- when a GC relocates/evicts a traceless-hooked method, the stale trap on
         // its old (recycled) page is disarmed here before re-arming at the new entry.
         .traceless_inline_unhooker =
-            [](auto func) -> bool { return kpm_ssol_unhooker(func) != 0; },
+            [](auto func) -> bool { return kpm_inline_unhooker(func) != 0; },
+        // Phase B.2 R^X shadow-page backend (Java methods only). Ships OFF: it engages only when
+        // persist.kpmhook.wx=1 AND this is a KPM-gated process AND the qc is a file-backed AOT body
+        // (B.7.3 location rule: R^X is for .oat/.odex/.art only -- a libart.so qc is a SHARED stub,
+        // a JIT-cache qc is a page ART keeps writing, and both are refused here with their reason,
+        // as is anything unclassifiable). On null, DoHook falls through to the L2 path and then to
+        // the normal in-place entry swap -- the reason is in logcat under the "kpmhook" tag.
+        // This is the backend that keeps ART's unwinder happy (the patched code still runs at
+        // its own address, so no clone/SSOL PC ever enters a stack frame).
+        .wx_inline_hooker =
+            [](auto target, auto replace) -> void * {
+                char v[PROP_VALUE_MAX] = {0};
+                if (!kUseKpmBackend ||
+                    __system_property_get("persist.kpmhook.wx", v) <= 0 || v[0] != '1')
+                    return nullptr;
+                if (!QcIsRxArmable(target)) return nullptr;  // logs the site + the reason itself
+                void *stub = kpm_wx_java_hooker(target, replace);
+                LOGI("[wx] R^X shadow-page Java hook: qc={} -> trampoline {}, call-original "
+                     "stub={} ({})",
+                     target, replace, stub, stub ? "TRACELESS" : "in-place fallback");
+                return stub;
+            },
+        // Paired un-hooker: put the original PTE back for the shadow page armed over `func`
+        // (a quick-compiled entry -- never rewritten by this backend, so always recoverable from
+        // the ArtMethod). Not property-gated: it is a no-op unless the entry is in the backend's
+        // table, and gating it would leak an armed page if the property were flipped off between
+        // hook and unhook.
+        .wx_inline_unhooker =
+            [](auto func) -> bool {
+                // A shared-stub entry belongs to the ROUTER, never to a per-method shadow page.
+                // This address is `target->GetEntryPoint()` for the method being unhooked, and for
+                // a router-routed method that IS the shared interpreter stub -- releasing the patch
+                // keyed on it would disarm the router for every routed method at once. Refuse and
+                // say so (SharedRouterUnhook already claimed this method; this is the belt for a
+                // method that reached here some other way).
+                if (vector::native::WxRouterOwnsSharedStub(func)) {
+                    LOGI("[router] wx unhook skipped for {}: it is ART's shared interpreter entry, "
+                         "i.e. the router's patch, not a per-method shadow page",
+                         func);
+                    return false;
+                }
+                return kpm_wx_java_unhooker(func) != 0;
+            },
+        // Phase B.7.2 SHARED-STUB ROUTER -- the backend for methods with NO compiled body of their
+        // own (their entry point is ART's SHARED nterp stub). Asked FIRST: it is the only backend
+        // that can cover that case tracelessly, and its eligibility test (qc == the nterp entry
+        // resolved from ART's symbols) is mutually exclusive with the per-method backends' tests.
+        // It decides and logs; null on anything it will not take, and DoHook then runs the
+        // R^X / clone / in-place chain exactly as before. Ships OFF (persist.kpmhook.router=1):
+        // taking this path arms a GLOBAL entry point, so it must be an explicit choice.
+        // NOTE the arguments: target and hook as ArtMethod* (a swap of x0 needs the hook's Art
+        // Method, not a code address), plus the target's current entry for the symbol comparison.
+        .shared_router_hooker =
+            [](void *target, void *hook, void *qc) -> void * {
+                // g_art_entry_point_offset is read, not captured: it is resolved from LSPlant once
+                // the hooker is initialized, and this callback only ever runs after that.
+                return vector::native::SharedRouterHook(target, hook, qc, g_art_entry_point_offset);
+            },
+        // Paired un-hooker. TRUE = the router owned this method (now unrouted) and the R^X
+        // un-hooker must not be asked about its entry point (see the guard above). Not
+        // property-gated, for the same reason as wx_inline_unhooker: a property flip between hook
+        // and unhook must not be able to strand a routed entry in the table.
+        .shared_router_unhooker =
+            [](void *target) -> bool { return vector::native::SharedRouterUnhook(target); },
         // M-C (EXPERIMENTAL, default OFF via persist.kpmhook.fc): force-compile a non-AOT target
         // so the traceless path has a unique body to trap. KNOWN ISSUE: a synchronous compile-wait
         // in DoHook hangs app init (postAppSpecialize runs before the JIT thread is up, so the
@@ -768,6 +978,15 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
 
     // Initialize ART hooks via the native library.
     this->InitArtHooker(env_, init_info_);
+    // LSPlant has now resolved ART's ArtMethod layout, so the shared-stub router's one piece of
+    // ArtMethod knowledge -- where `entry_point_from_quick_compiled_code_` lives -- is available.
+    // It is asked for HERE, once, and never assumed: the router's hit path uses it to enter a
+    // replacement through the replacement's own entry point (see the block comment in
+    // native/src/kpm/kpmhook.c). A 0 (unresolved) makes every router install fail closed.
+    g_art_entry_point_offset =
+        static_cast<uint32_t>(lsplant::GetArtMethodEntryPointOffset());
+    LOGI("[router] ArtMethod entry-point offset = 0x{:x} (from LSPlant's ArtMethod layout)",
+         g_art_entry_point_offset);
     // L2a DBI-on-oat self-test (no-op unless persist.kpmhook.l2test=1 AND KPM-gated process).
     RunL2SelfTest(env_);
     if (env_) env_->GetJavaVM(&g_vm);  // for the traceless-convert worker thread (needs ART attach)
@@ -775,14 +994,31 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     RunTracelessConvert();
     // (The stealth unpacker is started earlier in postAppSpecialize -- before the IPC-binder
     // scope check -- so it runs even for apps outside Vector's hooking scope.)
-    // Hide the LSPlant trampoline pool (rwxp anon) from this process's maps/smaps (no-op unless
-    // persist.kpmhook.l2=1 AND gated). Closes surface #2's trampoline leak.
-    RunTrampolineHide();
+    // Engage the maps-hide (no-op unless persist.kpmhook.{l2,wx}=1 AND gated). Closes surface #2
+    // for EITHER traceless backend: the wx path hides its own trampoline pool region the instant
+    // it arms (and its stub pool is VMA-less, so it is never visible at all); the in-place
+    // fallback and any late-minted region are covered by the per-region scans below.
+    bool hide_engaged = RunTrampolineHide();
     // Detection probe (no-op unless persist.kpmhook.probe=1): the GOAL judge, scans this
     // process's hook-detection surfaces on a delayed thread.
     RunDetectionProbe();
+    // Phase B.7.1 POC (no-op unless persist.kpmhook.routerpoc=1): resolve ART's shared
+    // interpreter entry from symbols and R^X-patch it ONCE with the shared-stub router. NOT the
+    // hook path -- it routes nothing by itself; the 1-entry table decides, so an empty table
+    // makes every interpreted call take the miss path, which is the red-line-4 test.
+    // See native/src/kpm/wx_router_poc.cpp and PHASE-B7-1-ROUTER-POC.md.
+    vector::native::WxRouterPocArmIfEnabled(g_art_entry_point_offset);
     // Initialize JNI hooks via the native library.
     this->InitHooks(env_);
+    // B.3/B.4: scan SYNCHRONOUSLY, right after the Java hooks are installed, so it lands before
+    // postAppSpecialize returns (i.e. before the target's startup self-check). A successful wx arm
+    // already re-scanned on kpm_wx_java_hooker's return path (LSPlant's trampoline exists by then),
+    // but methods the wx backend REFUSES fall back to the in-place path, which allocates trampolines
+    // too -- those never pass through kpm_wx_java_hooker, so this is their cover at the same
+    // per-region cost. The +5s scan started in RunTrampolineHide stays as the backstop for regions
+    // minted later (and for the framework dex Vector loads in memory). Same gate, so hiding stays
+    // off when disabled.
+    if (hide_engaged) HideRwxpRegionsScan();
     // Find the Java entrypoint.
     this->SetupEntryClass(env_);
 

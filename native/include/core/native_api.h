@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 #include <dobby.h>
+#include <stdint.h>
 
 #include <string>
 #include <utils/hook_helper.hpp>
@@ -110,9 +111,36 @@ int kpm_inline_unhooker(void *func);
 // libart-FUNCTION pages). Used by LSPlant's traceless_inline_hooker; returns the unmapped backup VA.
 void *kpm_ssol_hooker(void *target, void *hooker);
 int kpm_ssol_unhooker(void *func);
+// Phase B.2 traceless Java-method hook via the kernel's R^X shadow page: the method's compiled
+// code keeps running at its OWN address (so ART's unwinder/StackMap lookups are untouched) while
+// execution sees a 16-byte patch and readers see the original bytes. `target` is the qc entry,
+// `hooker` the trampoline. Returns the call-original stub for the backup ArtMethod, or null with
+// the reason in logcat. Used by LSPlant's wx_inline_hooker; gated by persist.kpmhook.wx.
+void *kpm_wx_java_hooker(void *target, void *hooker);
+int kpm_wx_java_unhooker(void *func);
+// Arm a 16-byte patch into the shadow copy of `addr`'s page in this process (0 = ok).
+int kpm_wx_patch(uint64_t addr, const uint8_t patch[16]);
+// Phase B.7.1 POC only -- the shared-stub router's arm/disarm/test-pair API. The entry must come
+// from ART's symbols (see vector::native::WxRouterPocArmIfEnabled below); these are declared in
+// native/src/kpm/kpmhook.h with the full contract.
+int kpm_wx_router_poc_arm(uint64_t entry, uint64_t target_am, uint64_t replacement_am,
+                          uint32_t quickcode_offset);
+int kpm_wx_router_poc_disarm(void);
+void kpm_wx_router_poc_dump(void);
+// Phase B.7.2 -- the hook path's write side: arm the router if needed and route one method onto
+// it (kpm_wx_router_add), or stop routing it (kpm_wx_router_remove). Driven by
+// vector::native::SharedRouterHook/Unhook below, which own the eligibility decision.
+int kpm_wx_router_add(uint64_t entry, uint64_t target_am, uint64_t replacement_am,
+                      uint32_t quickcode_offset);
+int kpm_wx_router_remove(uint64_t target_am);
 // Hide an anomalous region (page of `addr`) from this process's /proc/self/{maps,smaps} via
 // the KPM's mm-gated maps-hide -- e.g. the LSPlant trampoline pool (rwxp anon). Gated process only.
 int kpm_hide_region(void *addr);
+// Hide every UNNAMED executable region of this process (LSPlant's trampoline pool + the KPM's
+// clones) page by page. Named anon regions (ART's [anon:jit-code-cache]) are left alone. Returns
+// the page count hidden. Single implementation of the module's anon-exec scan; safe to call with no
+// lock held (it takes the backend's internal lock per page), and it issues no VA-scoped operation.
+int kpm_hide_all_anon_exec(void);
 }
 
 namespace vector::native {
@@ -120,6 +148,60 @@ namespace vector::native {
 // Use the traceless KPM backend for inline hooks when its bridge is available; flip
 // to false to force the stock Dobby backend everywhere.
 inline constexpr bool kUseKpmBackend = true;
+
+// Phase B.7.1 POC (mechanism test): resolve ART's shared interpreter entry `nterp_entry_point`
+// through ART's own symbol tables (the resolver LSPlant is handed as InitInfo::art_symbol_resolver)
+// and, only when `persist.kpmhook.routerpoc=1`, R^X-patch it once with the shared-stub router,
+// installing `persist.kpmhook.routerpoc.am`/`.repl` as the table's test entry. A no-op otherwise,
+// and it fails closed with the reason in logcat.
+// `quickcode_offset` is LSPlant's ArtMethod::GetEntryPointOffset() -- the hit path needs it to enter
+// a replacement through the replacement's own entry point; an unknown (0) offset refuses the arm.
+// Defined in native/src/kpm/wx_router_poc.cpp; called once from postAppSpecialize.
+void WxRouterPocArmIfEnabled(uint32_t quickcode_offset);
+
+// Phase B.7.2 -- the shared-stub router as a HOOK BACKEND. Wired into LSPlant as
+// InitInfo::shared_router_hooker / shared_router_unhooker; this is where the ELIGIBILITY decision
+// lives (see PHASE-B7-2-DOHOOK-WIRING.md §2.1):
+//
+//   SharedRouterHook(target, hook, qc, quickcode_offset)
+//     `target` is the target method's ArtMethod*, `hook` the hook's ArtMethod*, `qc` the target's
+//     current quick-compiled entry (`target->GetEntryPoint()` at DoHook time). Eligible iff `qc`
+//     EQUALS the `nterp_entry_point` this file resolved from ART's symbols -- never a code-size or
+//     memory-shape heuristic (red line 5). A qc equal to the with-clinit nterp entry is refused
+//     with its own log line (it shares nterp's page; one W^X patch per page). On success the router
+//     routes target -> hook and the returned value is the entry a call-original must use (the
+//     shared nterp stub itself -- correct precisely because the backup is a distinct ArtMethod, so
+//     a call through it MISSES the table and runs the original bytecode).
+//     `quickcode_offset` (LSPlant's ArtMethod::GetEntryPointOffset()) is what the router uses on a
+//     hit to read `hook->entry_point_from_quick_compiled_code_` and enter the hook through ART's
+//     own entry for it, instead of handing `hook` to the shared nterp stub -- which would feed
+//     nterp a method it was never entered for (see the block comment in kpmhook.c). It must come
+//     from ART's layout, never a hardcoded constant; a 0 offset is refused.
+//     Returns null on any refusal, with the exact reason in logcat; DoHook then falls through to
+//     the other backends and finally to the in-place entry swap.
+//     Gated by `persist.kpmhook.router=1` (ships OFF, like every other KPM backend here).
+//
+//   SharedRouterUnhook(target)
+//     Returns true if the router owned `target` (which is then removed from the table -- the arm
+//     itself stays live, since the patch is shared by every routed method); false if it did not.
+//
+//   WxRouterOwnsSharedStub(qc)
+//     True if `qc` is one of ART's shared interpreter entries. The module uses it to keep the
+//     per-method R^X un-hooker away from the router's patch: a routed method's ArtMethod entry IS
+//     the shared stub, so an unhook keyed on it would find the router's shadow slot and release it,
+//     disarming every routed method at once. (kpm_wx_java_unhooker refuses that too -- this is the
+//     same guard on the caller's side.)
+void *SharedRouterHook(void *target, void *hook, void *qc, uint32_t quickcode_offset);
+bool SharedRouterUnhook(void *target);
+bool WxRouterOwnsSharedStub(void *qc);
+
+// Phase B.7.3 -- WHICH shared interpreter entry is this? 0 = neither, 1 = nterp_entry_point (the
+// router's entry), 2 = nterp_with_clinit_entry_point (refused everywhere: it shares nterp's page
+// and the R^X backend allows one patch per page). A refinement of WxRouterOwnsSharedStub, used by
+// module.cpp's QcSiteOf so the site classifier can NAME the entry it refused -- both values come
+// from ART's symbols, never from the shape of memory (B.7.3 red line 4).
+// Defined in native/src/kpm/wx_router_poc.cpp.
+int WxRouterSharedStubKind(void *qc);
 
 // The entry point function that native modules must export (`native_init`).
 using NativeInit = NativeOnModuleLoaded (*)(const NativeAPIEntries *entries);

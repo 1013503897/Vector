@@ -6,7 +6,10 @@ set(CMAKE_CXX_STANDARD 23)
 
 add_subdirectory(${VECTOR_ROOT}/external external)
 
-file(GLOB_RECURSE NATIVE_SOURCES "src/*.cpp")
+# CONFIGURE_DEPENDS so a new source file re-runs the configure step by itself. Without it the
+# glob is only evaluated when something else forces a reconfigure, and the new file is silently
+# not compiled -- which shows up much later as an undefined symbol at link time.
+file(GLOB_RECURSE NATIVE_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 
 # Stealth-hook backend (vendored from ../../stealth-poc/lib): the libdbi AArch64
 # recompiler + the kpmhook glue that maps LSPlant's inline_hooker/unhooker onto our
