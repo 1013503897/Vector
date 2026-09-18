@@ -57,6 +57,8 @@ jobs:
         uses: seanmiddleditch/gha-setup-ninja@v6
         with:
           version: 1.12.1
+        # NOTE: SDK CMake 4.1.2 (installed below) bundles Ninja 1.12.1 and is what AGP
+        # actually uses via CMAKE_MAKE_PROGRAM; this PATH ninja is a harmless fallback.
 
       - name: Setup ccache
         uses: actions/cache@v5
@@ -71,9 +73,12 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Remove Android's cmake
+      - name: Install CMake 4.1.2
         shell: bash
-        run: rm -rf $ANDROID_HOME/cmake
+        # build.gradle.kts pins cmake to exactly 4.1.2 (lsplant/dex_builder need Ninja >= 1.11
+        # for C++20 FILE_SET CXX_MODULES; the older SDK cmake 3.x forks ship Ninja 1.10.2).
+        # Keep the SDK cmakes in place and add 4.1.2 so AGP resolves the pinned version.
+        run: yes | sdkmanager "cmake;4.1.2"
 
       - name: Build with Gradle
         run: |
