@@ -83,7 +83,11 @@ subprojects {
             buildFeatures { buildConfig = true }
             externalNativeBuild {
                 cmake {
-                    version = "3.29.8+"
+                    // lsplant/dex_builder use C++20/23 `FILE_SET CXX_MODULES`, which need Ninja
+                    // >= 1.11. SDK CMake 3.30.5 ships Ninja 1.10.2 (too old); CMake 4.1.2 ships
+                    // Ninja 1.12.1. Pin 4.1.2 exactly — an "x+" floor (e.g. "3.29.8+") does NOT
+                    // make AGP 8.13 cross into the 4.x line. Install with `sdkmanager "cmake;4.1.2"`.
+                    version = "4.1.2"
                     buildStagingDirectory = layout.buildDirectory.get().asFile
                 }
             }
