@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <mutex>
 #include <unordered_set>
 #include <vector>
@@ -137,7 +138,7 @@ uint64_t ExecuteHook(void *self, const void *accessor, void *shadow_frame, uint6
 
 }  // namespace
 
-size_t CaptureInterpreted(CodeItemSink *sink, int window_ms) {
+size_t CaptureInterpreted(CodeItemSink *sink, int window_ms, const std::function<void()> &driver) {
     if (!sink) return 0;
     const auto &I = art::Get();
     if (!I.ok_for_interp_capture()) {
@@ -146,21 +147,37 @@ size_t CaptureInterpreted(CodeItemSink *sink, int window_ms) {
         return 0;
     }
     g_I = &I;
-    g_seen.clear();
-    g_recs.clear();
-    g_buf.clear();
-    g_buf.reserve(1 << 22);   // 4 MB of CodeItem bytes
-    g_recs.reserve(1 << 16);
-
-    if (DobbyHook(I.interpreter_execute, reinterpret_cast<dobby_dummy_func_t>(&ExecuteHook),
-                  reinterpret_cast<dobby_dummy_func_t *>(&g_orig_execute)) != 0) {
-        LOGW("[unpack] interp: DobbyHook(Execute) failed @ {}", I.interpreter_execute);
-        g_I = nullptr;
-        return 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_seen.clear();
+        g_recs.clear();
+        g_buf.clear();
+        g_buf.reserve(1 << 22);   // 4 MB of CodeItem bytes
+        g_recs.reserve(1 << 16);
     }
-    LOGI("[unpack] interp: Execute hooked @ {}; capturing for {}ms", I.interpreter_execute,
-         window_ms);
+
+    // Idempotent install: a prior CaptureInterpreted (or a combined interp+invoke run) may have left
+    // Execute hooked (we never DobbyDestroy it — see the note below). Re-hooking a live trampoline is
+    // unsafe, so reuse the existing hook and only re-arm the buffers.
+    if (g_orig_execute == nullptr) {
+        if (DobbyHook(I.interpreter_execute, reinterpret_cast<dobby_dummy_func_t>(&ExecuteHook),
+                      reinterpret_cast<dobby_dummy_func_t *>(&g_orig_execute)) != 0) {
+            LOGW("[unpack] interp: DobbyHook(Execute) failed @ {}", I.interpreter_execute);
+            g_I = nullptr;
+            return 0;
+        }
+        LOGI("[unpack] interp: Execute hooked @ {}", I.interpreter_execute);
+    } else {
+        LOGI("[unpack] interp: Execute already hooked @ {} (reusing)", I.interpreter_execute);
+    }
     g_capturing.store(true, std::memory_order_relaxed);
+    if (driver) {
+        LOGI("[unpack] interp: running in-window driver (Tier-C active-invoke) then {}ms residual",
+             window_ms);
+        driver();  // e.g. ActiveInvokeAllMethods — restores are captured live by ExecuteHook
+    } else {
+        LOGI("[unpack] interp: capturing for {}ms", window_ms);
+    }
     for (int waited = 0; waited < window_ms; waited += 200) usleep(200 * 1000);
     g_capturing.store(false, std::memory_order_relaxed);
     usleep(100 * 1000);  // let in-flight hook bodies drain

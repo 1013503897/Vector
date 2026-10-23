@@ -92,7 +92,7 @@ void ForNameCb(const char *desc, void *ctxp) {
 
 // app ClassLoader = ActivityThread.currentApplication().getClassLoader(). Returned as a GlobalRef
 // (stable across the load loop); caller deletes it.
-jobject GetAppClassLoader(JNIEnv *env) {
+jobject GetAppClassLoaderInternal(JNIEnv *env) {
     jclass at = env->FindClass("android/app/ActivityThread");
     if (!at) {
         env->ExceptionClear();
@@ -129,25 +129,15 @@ jobject GetAppClassLoader(JNIEnv *env) {
 
 }  // namespace
 
-size_t ActiveLoadAllClasses(void *jni_env, const void *const *classdefs, size_t n) {
+void *GetAppClassLoaderGlobalRef(void *jni_env) {
     JNIEnv *env = reinterpret_cast<JNIEnv *>(jni_env);
-    if (!env || !classdefs || n == 0) return 0;
+    if (!env) return nullptr;
+    return reinterpret_cast<void *>(GetAppClassLoaderInternal(env));
+}
 
-    jobject loader = GetAppClassLoader(env);
-    if (!loader) {
-        LOGW("[unpack] activeload: could not get app ClassLoader; skipping");
-        return 0;
-    }
-    jclass cls_class = env->FindClass("java/lang/Class");
-    jmethodID for_name = cls_class ? env->GetStaticMethodID(
-        cls_class, "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;")
-                                   : nullptr;
-    if (!for_name) {
-        env->ExceptionClear();
-        env->DeleteGlobalRef(loader);
-        LOGW("[unpack] activeload: Class.forName unresolved; skipping");
-        return 0;
-    }
+size_t ForEachAppClassDescriptor(const void *const *classdefs, size_t n,
+                                 void (*cb)(const char *descriptor, void *ctx), void *ctx) {
+    if (!classdefs || n == 0 || !cb) return 0;
 
     Maps maps;
     maps.load();
@@ -166,13 +156,11 @@ size_t ActiveLoadAllClasses(void *jni_env, const void *const *classdefs, size_t 
         if (!seen) regions.emplace_back(r->s, r->e);
     }
     if (regions.empty()) {
-        env->DeleteGlobalRef(loader);
-        LOGW("[unpack] activeload: no app dex regions among {} class-defs", n);
+        LOGW("[unpack] class-walk: no app dex regions among {} class-defs", n);
         return 0;
     }
 
-    FNCtx ctx{env, cls_class, for_name, loader, 0, 0};
-    size_t dexes = 0;
+    size_t descriptors = 0, dexes = 0;
     for (auto &reg : regions) {
         const uint8_t *region_start = reinterpret_cast<const uint8_t *>(reg.first);
         const uint8_t *region_end = reinterpret_cast<const uint8_t *>(reg.second);
@@ -181,17 +169,43 @@ size_t ActiveLoadAllClasses(void *jni_env, const void *const *classdefs, size_t 
             const uint8_t *base = dex::LocateDexByInvariants(from, region_end);
             if (!base) break;
             dexes++;
-            dex::EnumerateClassDescriptors(base, region_end, &ForNameCb, &ctx);
+            descriptors += dex::EnumerateClassDescriptors(base, region_end, cb, ctx);
             uint32_t fsz = dex::DexFileSize(base);
             const uint8_t *next = base + (fsz ? fsz : 0x70);
             if (next <= from) break;   // no progress -> avoid an infinite loop
             from = next;
         }
     }
+    LOGI("[unpack] class-walk: {} app dex(es) in {} region(s) -> {} descriptor(s)", dexes,
+         regions.size(), descriptors);
+    return descriptors;
+}
+
+size_t ActiveLoadAllClasses(void *jni_env, const void *const *classdefs, size_t n) {
+    JNIEnv *env = reinterpret_cast<JNIEnv *>(jni_env);
+    if (!env || !classdefs || n == 0) return 0;
+
+    jobject loader = GetAppClassLoaderInternal(env);
+    if (!loader) {
+        LOGW("[unpack] activeload: could not get app ClassLoader; skipping");
+        return 0;
+    }
+    jclass cls_class = env->FindClass("java/lang/Class");
+    jmethodID for_name = cls_class ? env->GetStaticMethodID(
+        cls_class, "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;")
+                                   : nullptr;
+    if (!for_name) {
+        env->ExceptionClear();
+        env->DeleteGlobalRef(loader);
+        LOGW("[unpack] activeload: Class.forName unresolved; skipping");
+        return 0;
+    }
+
+    FNCtx ctx{env, cls_class, for_name, loader, 0, 0};
+    ForEachAppClassDescriptor(classdefs, n, &ForNameCb, &ctx);
 
     env->DeleteGlobalRef(loader);
-    LOGI("[unpack] activeload: {} app dex(es) in {} region(s) -> forName loaded={} failed={}", dexes,
-         regions.size(), ctx.loaded, ctx.failed);
+    LOGI("[unpack] activeload: forName loaded={} failed={}", ctx.loaded, ctx.failed);
     return ctx.loaded;
 }
 

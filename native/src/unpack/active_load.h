@@ -17,4 +17,19 @@ namespace vector::native::unpack {
 // the dump captures the restored code. Exceptions per class are swallowed; failure is fail-safe (0).
 size_t ActiveLoadAllClasses(void *jni_env, const void *const *classdefs, size_t n);
 
+// ---- shared helpers (also used by active_invoke.cpp, Tier-C) ----
+
+// The app's ClassLoader as a JNI GlobalRef, returned as an opaque void* (jobject). Caller MUST
+// release it via env->DeleteGlobalRef. Null on failure. (ActivityThread.currentApplication()
+// .getClassLoader().)
+void *GetAppClassLoaderGlobalRef(void *jni_env);
+
+// Walk every class descriptor ("Lcom/foo/Bar;") of the app's loaded dex(es) — located by resolving
+// `classdefs` to their /proc/self/maps regions and keeping only APP (non-framework) regions — and
+// call cb(descriptor, ctx) once per class. Pure dex parsing (needs no ClassLoader). Returns the
+// number of descriptors enumerated. Shared by ActiveLoadAllClasses (forName) and
+// ActiveInvokeAllMethods (reflective invoke).
+size_t ForEachAppClassDescriptor(const void *const *classdefs, size_t n,
+                                 void (*cb)(const char *descriptor, void *ctx), void *ctx);
+
 }  // namespace vector::native::unpack

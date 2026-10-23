@@ -70,6 +70,11 @@ void kpm_hook_fshide_enable(void);
  */
 void kpm_hook_set_process_name(const char *name);
 
+/* Arm shpte do_exit (exit_group self-kill neutralize) for `tgid` via the sysinfo bridge. Driven
+ * in-process at inject time so it wins the race vs Appdome's flaky-fast exit_group tamper self-kill
+ * (device-observed 338ms..75s). Prop-independent caller (module.cpp) uses this for GCash directly. */
+int kpm_exittarget_arm(int tgid);
+
 /*
  * Probe the bridge and cache getpid(). Returns 0 if this process is gated-in AND the
  * bridge is live; <0 otherwise (gated out, or bridge not armed) -- in which case no

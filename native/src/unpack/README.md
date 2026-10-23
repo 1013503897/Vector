@@ -58,6 +58,9 @@ name). Set with `resetprop` (APatch: `/data/adb/ap/bin/resetprop`). Output lands
 | `.interp` | 0 | interpreter-point capture (hook `art::interpreter::Execute`, FART-style) |
 | `.interp_ms` | 30000 | interp capture window |
 | `.activeload` | 0 | `Class.forName` every class (per-class DefineClass-restore shells, e.g. dpt) |
+| `.invoke` | 0 | **Tier-C FART** — reflectively invoke every method/ctor (restore-**on-invoke** shells). Enumerates via `dexfind`; captures via the interp Execute hook (auto-run). Static→null recv, instance→`Unsafe.allocateInstance`, ctors→`newInstance`; only Java exceptions raised (process-safe) |
+| `.invoke_ms` | 60000 | active-invoke wall-time budget (checked between classes) |
+| `.invoke_residual_ms` | 3000 | interp capture window kept open AFTER the invoke driver, for late/async restores |
 | `.extout` | 0 | write dumps to the app's EXTERNAL dir (pullable past strict SELinux MLS) |
 | `.predelay_ms` | 6000 | dexfind: wait before the `FindClass` hook so the app loads its classes |
 | **`.worker_delay_ms`** | **0** | **NEW — sleep before the worker's first ART touch (AttachCurrentThread / `art::Get()`). See "self-libart-patching shells" below.** |
@@ -101,7 +104,34 @@ structure dex by method count (`(region, method_idx)` is self-consistent) and di
 captured CodeItems against that dex's constant pool. (This recovered 51job's request-sign from
 364k+ captures.)
 
+### Recipe — method-extraction shell that restores ONLY on invoke (Tier-C FART)
+
+Some 抽取壳 never refill a method's CodeItem at class-load or compile — only when the method is
+actually **called**. `dexfind`/`trigger`/`activeload` all miss those. Tier-C invokes every method:
+
+```
+resetprop persist.kpmhook.unpack 1
+resetprop persist.kpmhook.target <pkg>
+resetprop persist.kpmhook.unpack.dexfind 1        # enumerate classes + dump structure dexes
+resetprop persist.kpmhook.unpack.invoke 1         # + reflectively invoke every method/ctor
+resetprop persist.kpmhook.unpack.invoke_ms 60000
+resetprop persist.kpmhook.unpack.traceless 1      # if the app RASP-scans libart integrity
+```
+Order per run: `dexfind` enumerates + dumps the structure dexes and publishes the class-defs; then
+active-invoke runs INSIDE an interp-capture window (`ActiveInvokeAllMethods` as the driver), so each
+restored CodeItem is grabbed live at `art::interpreter::Execute` and written to `captures.txt`. Pull
+`region_*_fixed.dex` + `captures.txt`, splice offline. `activeload` (restore-on-classload) and
+`invoke` (restore-on-invoke) compose — enable both for maximum coverage.
+
+**Risk (production caution):** reflection runs real method/constructor bodies. `try/catch` swallows
+every *Java* exception (NPE / IllegalArgument / InvocationTarget / InstantiationException), so the
+process survives — but a *native* crash inside an invoked body is still fatal, and constructors
+(`newInstance`) may have real side effects. Test on a benign packed sample first; never Tier-C a
+production target (GCash/易盾) blind. A single hung (infinite-loop) method can overrun `invoke_ms`
+(the budget is checked between classes, not mid-method). If `sun.misc.Unsafe` is unreachable,
+instance methods are skipped and static methods + constructors still run.
+
 ## Hard limits (design §8)
 
 VMP / dex2c / bytecode-virtualization shells have NO standard CodeItem → out of scope,
-stealth does not help. Tier-C carries FART-class crash risk.
+stealth does not help. Tier-C reflection runs real code (Java-exception-safe, native-crash-fatal).

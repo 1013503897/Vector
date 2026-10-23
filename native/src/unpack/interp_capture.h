@@ -16,16 +16,22 @@
 // app) proves the capture point; full coverage (active class-load + active invoke) is a follow-on.
 
 #include <cstddef>
+#include <functional>
 
 namespace vector::native::unpack {
 
 class CodeItemSink;
 
-// Hook art::interpreter::Execute, capture every distinct method interpreted over `window_ms`, then
-// unhook and flush the captures into `sink` (captures.txt, the same format increment-2b emits ->
-// tools/dexfixer/splice.py). Runs on the worker thread (blocks for the window); the hook fires on
-// the app's own runnable threads. No-op (returns 0) unless ok_for_interp_capture(). Returns the
-// number of distinct methods captured.
-size_t CaptureInterpreted(CodeItemSink *sink, int window_ms);
+// Hook art::interpreter::Execute, capture every distinct method interpreted, then flush the captures
+// into `sink` (captures.txt, the same format increment-2b emits -> tools/dexfixer/splice.py). Runs
+// on the worker thread (blocks); the hook fires on the app's own runnable threads. No-op (returns 0)
+// unless ok_for_interp_capture(). Returns the number of distinct methods captured.
+//
+// Capture spans: (1) `driver()` if provided — run WHILE capturing, e.g. Tier-C active-invoke, so the
+// CodeItems it forces to restore are grabbed live; then (2) a residual `window_ms` of passive/
+// operator-driven execution. Idempotent: if Execute is already hooked (a prior call left it in), the
+// hook is reused (never double-patched) and only the capture buffers are re-armed.
+size_t CaptureInterpreted(CodeItemSink *sink, int window_ms,
+                          const std::function<void()> &driver = {});
 
 }  // namespace vector::native::unpack

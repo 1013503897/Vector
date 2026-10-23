@@ -6,7 +6,15 @@
 //   Tier A (passive)       : no driving; rely on natural execution through the choke hook.
 //   Tier B (force-compile) : reuse the ForceCompileMethod path (EnqueueOptimizedCompilation)
 //                            -> ART reads the CodeItem to compile. Does NOT run app code -> safe.
-//   Tier C (invoke)        : ArtMethod::Invoke with a fabricated frame. FART-style; risky.
+//   Tier C (invoke)        : FART's fartwithClassloader — invoke every method to force restore.
+//
+// NOTE: Tier C is IMPLEMENTED in active_invoke.cpp via SAFE Java reflection (static -> null recv,
+// instance -> Unsafe.allocateInstance blank object, ctors -> newInstance; only Java exceptions
+// raised, process survives), driven from the unpacker worker INSIDE an interp-capture window — NOT
+// through this native EnumerateAndDrive path. The native ArtMethod::Invoke-with-fabricated-frame
+// route (below) is intentionally left unimplemented: a native crash there is fatal and cannot
+// siglongjmp safely out of the ART interpreter. This file's Tier-B force-compile driver is the only
+// live user of the choke-hook path.
 
 #include <cstddef>
 

@@ -194,6 +194,46 @@ static int proc_is_target(void)
     return 0;
 }
 
+/* Like proc_is_target(), but ALSO matches the target's child processes ("<target>:<subproc>",
+ * e.g. com.globe.gcash.android:tools). Used ONLY to widen the maps-hide (kpm_hide_region /
+ * ensure_init's bridge probe) to a target's subprocesses -- their in-place LSPlant trampolines
+ * are the same anon-exec maps-scan surface (#2) an anti-tamper flags, and the KPM maps-hide is
+ * per-(mm,page) so it is multi-process safe. The SSOL traceless backend is DELIBERATELY NOT
+ * widened this way (kpm_ssol_hooker / kpm_inline_hooker keep the exact proc_is_target() gate):
+ * the KPM's single-step trap is single-target-tgid gated, so a subprocess SSOL trap would be
+ * unhandled -> SIGTRAP. Subprocesses thus get in-place hooks whose trampolines are HIDDEN, but
+ * never SSOL. */
+static int proc_is_target_family(void)
+{
+    if (proc_is_target()) return 1;  /* exact target / UID / compile-time gates */
+
+    char cmd[256];
+    const char *name = g_proc_name;
+    if (!name[0]) {
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd < 0) return 0;
+        ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
+        close(fd);
+        if (r <= 0) return 0;
+        cmd[r] = 0;
+        name = cmd;
+    }
+    char target[PROP_VALUE_MAX];
+    if (__system_property_get("persist.kpmhook.target", target) > 0 && target[0]) {
+        size_t tl = strlen(target);
+        /* "<target>:<subproc>" -- Android's private-process naming for :tools/:remote/etc. */
+        if (strncmp(name, target, tl) == 0 && name[tl] == ':') return 1;
+    }
+#ifdef INJECTED_PACKAGE_NAME
+    {
+        const char *inj = KPM_STR(INJECTED_PACKAGE_NAME);
+        size_t il = strlen(inj);
+        if (strncmp(name, inj, il) == 0 && name[il] == ':') return 1;
+    }
+#endif
+    return 0;
+}
+
 /* Whether to run the dry-run census instead of arming hooks. The RV-0 build forces
  * it on at compile time (SELinux-proof -- an injected app cannot read a custom
  * persist.* prop); otherwise it is opt-in via persist.kpmhook.mode=characterize. */
@@ -266,7 +306,11 @@ static int ensure_init_locked(void)
 {
     if (g_inited) return 0;
     if (g_init_failed) return -1; /* gated out or bridge off -- don't re-probe */
-    if (!proc_is_target()) {      /* process gate: only the named test process engages the KPM */
+    /* Gate the KPM backend to the target FAMILY (target + its :subprocesses). The bridge probe
+     * and maps-hide (kpm_hide_region) are safe & wanted in subprocesses (per-mm hide). The SSOL
+     * traceless hookers re-check the EXACT gate (proc_is_target) themselves, so a subprocess still
+     * never arms an SSOL single-step trap (which is single-tgid gated -> would SIGTRAP). */
+    if (!proc_is_target_family()) {
         g_init_failed = 1;
         return -1;
     }
@@ -554,6 +598,10 @@ void *kpm_inline_hooker(void *target, void *hooker)
     void *backup = 0;
     pthread_mutex_lock(&g_lock);
     if (ensure_init_locked() != 0) goto out;
+    /* SSOL is EXACT-target only (the KPM single-step trap is single-tgid gated): in a subprocess
+     * (family-gated for hide) bail so the caller keeps the in-place hook -- never arm an unhandled
+     * SSOL trap here. */
+    if (!proc_is_target()) goto out;
 
     /* dry-run characterize mode: measure the function's page-span, arm nothing,
      * return NULL so the caller (Vector) falls back to Dobby and the app stays
@@ -807,6 +855,10 @@ void *kpm_ssol_hooker(void *target, void *hooker)
     uint64_t bk = 0;
     pthread_mutex_lock(&g_lock);
     if (ensure_init_locked() != 0) goto out;
+    /* SSOL is EXACT-target only (single-tgid single-step gate): in a family-gated subprocess bail
+     * so LSPlant keeps the in-place ArtMethod swap (its trampoline is still maps-hidden) instead of
+     * arming an unhandled SSOL trap -> SIGTRAP. */
+    if (!proc_is_target()) goto out;
 
     uintptr_t t = (uintptr_t)target;
     struct srgn *e = find_srgn_locked(t); /* same-page qc share one trapped region */
@@ -893,6 +945,46 @@ int kpm_hide_region(void *addr)
     bridge_cmd(cmd, out, sizeof out);
     ok = reply_ok(out);
 out:
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+/* Arm shpte fshide (statfs + mountinfo/mounts hide) for THIS process's tgid, driven from in-process at
+ * inject time -> reliable early timing (before the RASP scans mounts) and correct reader-gate (the KPM
+ * hides for readers whose tgid is in the set; our own reads of /proc/self/mountinfo are then filtered).
+ * Hides /data/adb, overlay, magisk, KSU, worker, zygisk, /adb/modules, dex2oat mount lines (shpte
+ * mount_line_is_artifact) -> defeats the RASP's /proc/self/mountinfo root/injection scan. */
+int kpm_fshide_arm(int tgid)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) goto out;
+    char cmd[64], out[160];
+    bridge_cmd("fshide on", out, sizeof out);              /* global arm (idempotent) */
+    ok = reply_ok(out);
+    snprintf(cmd, sizeof cmd, "fshide add %d", tgid);      /* reader-gate this tgid */
+    bridge_cmd(cmd, out, sizeof out);
+    ok = ok && reply_ok(out);
+out:
+    pthread_mutex_unlock(&g_lock);
+    return ok;
+}
+
+/* Arm shpte do_exit (exit_group self-kill neutralize) for THIS process's tgid, driven in-process at
+ * inject time -> reliable EARLY timing. Appdome's exit_group tamper self-kill fires flaky (device-
+ * observed 338ms..75s); manual adb `exittarget` can't win that race, so Vector arms it the instant it
+ * injects GCash. shpte before_exit_group then do_exit(0)s only the calling monitor thread (process
+ * survives). Idempotent. */
+int kpm_exittarget_arm(int tgid)
+{
+    int ok = 0;
+    pthread_mutex_lock(&g_lock);
+    if (ensure_init_locked() != 0) goto out2;
+    char cmd[64], out[160];
+    snprintf(cmd, sizeof cmd, "exittarget %d", tgid);
+    bridge_cmd(cmd, out, sizeof out);
+    ok = reply_ok(out);
+out2:
     pthread_mutex_unlock(&g_lock);
     return ok;
 }

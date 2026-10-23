@@ -6,7 +6,9 @@ set(CMAKE_CXX_STANDARD 23)
 
 add_subdirectory(${VECTOR_ROOT}/external external)
 
-file(GLOB_RECURSE NATIVE_SOURCES "src/*.cpp")
+# CONFIGURE_DEPENDS: re-glob on each build so a newly added src/**/ *.cpp (e.g. a new unpack TU) is
+# picked up without a manual CMake reconfigure.
+file(GLOB_RECURSE NATIVE_SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 
 # Stealth-hook backend (vendored from ../../stealth-core/lib): the libdbi AArch64
 # recompiler + the kpmhook glue that maps LSPlant's inline_hooker/unhooker onto our

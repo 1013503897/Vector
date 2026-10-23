@@ -36,4 +36,10 @@ class CodeItemSink;
 size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, bool trigger,
                              bool active_load, bool traceless, int pre_ms);
 
+// Expose the class-def pointers collected by the most recent FindAndDumpClassDexes enumeration
+// (stable after that call returns, until the next one). Sets *out to the array and returns its
+// length; 0 (and *out=nullptr) if no enumeration has run. Used by Tier-C active-invoke to locate
+// the app's dex regions (same input ActiveLoadAllClasses / ActiveInvokeAllMethods take).
+size_t GetEnumeratedClassDefs(const void *const **out);
+
 }  // namespace vector::native::unpack

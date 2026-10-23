@@ -20,6 +20,9 @@
 
 #include "ipc_bridge.h"
 
+extern "C" int kpm_exittarget_arm(int tgid);  // native/src/kpm/kpmhook.c — arm shpte do_exit for a tgid
+extern "C" void kpm_hook_force_enable(void);  // native/src/kpm/kpmhook.c — bypass proc_is_target gate (GCash)
+
 namespace vector::native::module {
 
 // --- Process UID Constants ---
@@ -296,8 +299,22 @@ static void RunTrampolineHide() {
     char v[PROP_VALUE_MAX] = {0};
     if (!kUseKpmBackend || __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1') return;
     std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(5));  // after startup hooks install
-        HideRwxpRegionsScan();
+        // Early + LOOPED hide (was: single fire at +5s, which lost the race). sergei's LSPlant 改机
+        // hooks install ~1-2s into Java handleLoadPackage; the Appdome withhold detection fires
+        // ~3.9s after process start (RE-measured on GCash: main proc SIGSEGV -> SIG_DFL at +3.9s).
+        // A single hide at +5s therefore ran AFTER the crash. Hide repeatedly across the whole
+        // pre-detection window so every in-place trampoline (rwxp/r-xp anon) is registered with the
+        // KPM before the maps/smaps scan (surface #2). HideRwxpRegionsScan is cheap -- a fast
+        // /proc/self/maps read + per-page KPM register, NO ART suspend -- and the KPM hide-set
+        // dedups, so re-running every few hundred ms is safe and idempotent.
+        for (int i = 0; i < 14; i++) {  // ~0.3s .. ~4.2s: hook-install through pre-detection window
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            HideRwxpRegionsScan();
+        }
+        for (int i = 0; i < 8; i++) {   // sparse follow-up to ~12s: late hooks / periodic re-scans
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            HideRwxpRegionsScan();
+        }
     }).detach();
 }
 
@@ -311,7 +328,12 @@ static void RunTracelessConvert() {
     if (kpm_hook_init() != 0 || !g_vm) return;  // gated process + have a JavaVM
     g_convert_state = CONVERT_RUNNING;           // synchronous: the probe will wait for us to finish
     std::thread([] {
-        std::this_thread::sleep_for(std::chrono::seconds(6));  // JIT up + startup hooks installed
+        // Settle before converting: starting too early (1s) raced active app-init -- a just-converted
+        // method gets CALLED before its SSOL trap routing is fully live -> unhandled BRK -> SIGTRAP
+        // (signal 5) killed the process. The convert itself is FAST once the JIT has pre-compiled the
+        // bodies (~14 methods in ~0.1s), so 6s costs nothing against the ~22s re-scan while letting
+        // startup settle so no hot method is mid-call as we trap it.
+        std::this_thread::sleep_for(std::chrono::seconds(6));
         JNIEnv *env = nullptr;
         if (g_vm->AttachCurrentThread(&env, nullptr) == JNI_OK) {
             // The conversion needs the live art::jit::Jit instance -- captured the first time ART
@@ -503,6 +525,18 @@ private:
                 char v[PROP_VALUE_MAX] = {0};
                 if (!kUseKpmBackend ||
                     __system_property_get("persist.kpmhook.l2", v) <= 0 || v[0] != '1')
+                    return nullptr;
+                // SSOL (per-method single-step traceless) is DECOUPLED from l2. RE (workflow
+                // wf_b00aedf5) pinned the permissions-page main-thread wedge to an ART mutator_lock_
+                // suspend-all collapse: a thread running CALL-ORIGINAL on an SSOL-trapped body
+                // single-steps it (one UXN fault/insn), holding mutator_lock_ shared ~1000x too
+                // long, so any ScopedSuspendAll (convert/GC/SignalCatcher) starves -> main parks on
+                // the mutator futex -> ANR. l2 must still drive maps-hide (surface #2), so gate SSOL
+                // on its OWN prop, default OFF, until the DBI-clone call-original fix lands. With
+                // ssol off, DoHook takes the in-place path (surface #3 dirty but NO wedge) -- this
+                // also lets us test whether surface #3 is actually the ~20s withhold trigger.
+                char sv[PROP_VALUE_MAX] = {0};
+                if (__system_property_get("persist.kpmhook.ssol", sv) <= 0 || sv[0] != '1')
                     return nullptr;
                 if (!QcIsTraceable(target)) {
                     LOGI("[l2] qc={} not a traceable AOT body (interp/jit/shared stub) -> in-place",
@@ -722,6 +756,24 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
     lsplant::JUTFString nice_name_str(env_, args->nice_name);
     LOGD("Attempting injection into '{}'.", nice_name_str.get());
 
+    // Auto-arm shpte do_exit for GCash the INSTANT we inject — gated purely on the package name
+    // (NO prop read: persist.kpmhook.* is unreadable from the app process here, and this must beat
+    // Appdome's flaky-fast exit_group tamper self-kill, observed as early as ~338ms). shpte
+    // before_exit_group then do_exit(0)s only the monitor thread; the process survives.
+    if (nice_name_str.get() && strncmp(nice_name_str.get(), "com.globe.gcash.android", 23) == 0) {
+        // The KPM process gate (proc_is_target) only recognizes the build's INJECTED_PACKAGE_NAME
+        // (=com.android.shell) / UID 2000 / a readable persist.kpmhook.target — NONE match GCash
+        // (uid 10321, and untrusted_app cannot read the persist prop), so every KPM bridge call from
+        // GCash returned failure (exittarget/fshide/maps-hide/hooks all =0). Force-enable the gate for
+        // THIS (GCash) process so the KPM backend engages: this unblocks the gcashfix maps-hide +
+        // do_exit/kill neutralize (§7.24: Vector zygote maps-hide made the Appdome verdict read clean
+        // and reached the permission page). Scoped to the GCash process only (we're inside the
+        // package==GCash branch). Must precede any KPM call.
+        kpm_hook_force_enable();
+        int ea = kpm_exittarget_arm(getpid());
+        LOGV("[gcash] force-enabled KPM gate + auto-armed do_exit (exittarget self tgid={}) = {}", getpid(), ea);
+    }
+
     // Stealth unpacker (no-op unless persist.kpmhook.unpack=1 AND nice_name==target). Runs in
     // ANY injected-marked process -- it only needs to be in-process (dump dexes), so it is
     // INDEPENDENT of Vector's hooking scope / the IPC binder below. Must precede the no-binder
@@ -734,6 +786,28 @@ void VectorModule::postAppSpecialize(const zygisk::AppSpecializeArgs *args) {
         lsplant::JUTFString app_dir(env_, args->app_data_dir);
         unpack_started = vector::native::unpack::StartIfEnabled(uvm, env_, app_dir.get(),
                                                                 nice_name_str.get());
+    }
+
+    // [native-only for GCash] Appdome detects our injection at LOAD by enumerating the ClassLinker: the
+    // injected Java-framework InMemoryDexClassLoader (org.matrix.vector.* / com.sergei.one.*) + LSPlant
+    // generated classes ("Vector_", per-hook PathClassLoaders) are real, enumerable ART state (workflow
+    // wf_4ead3efb + heap-scan RE captured de.robv.* / PmxpedBridge live). That injection-detection is the
+    // DOMINANT, earliest fuse input -> fuse blows ~7s -> withhold crypto-sabotage (any SecureRandom/TLS ->
+    // SIGILL) + UDF/kill. It CANNOT be hidden (the objects are real). The native gcashfix worker
+    // (StartIfEnabled above -> RunGcashNeutralize) already runs on a PURE-NATIVE path (kpm_inline_hooker
+    // root-file/maps/mount/dl_iterate hiding + exit/kill neutralize) with ZERO ClassLinker footprint and
+    // force-enables the KPM gate itself. So for GCash, SKIP the whole Java-framework load below
+    // (RequestAppBinder/FetchFrameworkDex/LoadDex/InitArtHooker/InitHooks/SetupEntryClass/forkCommon->
+    // sergei): no injected class/loader enters ART -> the ART-injection fuse input disappears BY
+    // CONSTRUCTION. Root/maps/mount evasion is retained natively by the gcashfix worker; response-arm Java
+    // hooks (killProcess/funnel) become unnecessary once the fuse never blows. Mirrors the !binder
+    // early-return (keep the module mapped: the native unpack worker is running). Residuals handled
+    // separately: ADB-settings (device-side settings put), Firebase-fetch splash nav (out of this gate).
+    if (nice_name_str.get() && strncmp(nice_name_str.get(), "com.globe.gcash.android", 23) == 0) {
+        LOGI("[gcash] native-only: skip Java-framework/LSPlant load (no ART classloader footprint); "
+             "native gcashfix worker retained");
+        SetAllowUnload(!unpack_started);  // keep loaded: the native gcashfix worker is running
+        return;
     }
 
     auto &ipc_bridge = IPCBridge::GetInstance();

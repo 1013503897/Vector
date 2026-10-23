@@ -155,6 +155,10 @@ struct CapRec {
 };
 
 std::vector<const void *> *g_defs = nullptr;       // owned by FindAndDumpClassDexes
+// Snapshot of the last enumeration's class-defs, exposed via GetEnumeratedClassDefs (points at the
+// function-static `defs` below, stable until the next FindAndDumpClassDexes call).
+const void *const *g_last_defs = nullptr;
+size_t g_last_defs_n = 0;
 std::vector<MethodRef> *g_methods = nullptr;       // increment-2: (method, classdef) (or null)
 std::vector<uint8_t> *g_capbuf = nullptr;          // increment-2b: concatenated CodeItem bytes
 std::vector<CapRec> *g_caprecs = nullptr;          // increment-2b: (cd, idx, off, len)
@@ -331,6 +335,10 @@ size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, boo
          "{} skipped(faulted)",
          defs.size(), methods.size(), g_triggered.load(), g_tg_skipped.load());
 
+    // Publish the class-defs for Tier-C active-invoke (stable until the next call re-clears `defs`).
+    g_last_defs = defs.data();
+    g_last_defs_n = defs.size();
+
     // increment-2d: force-load every class of the app dex(es) so a per-class extraction shell
     // restores ALL CodeItems in place (incl. classes the app never reached), THEN dump.
     if (active_load && jni_env) {
@@ -362,6 +370,11 @@ size_t FindAndDumpClassDexes(CodeItemSink *sink, void *jni_env, int wait_ms, boo
     g_caprecs = nullptr;
     g_I = nullptr;
     return dumped;
+}
+
+size_t GetEnumeratedClassDefs(const void *const **out) {
+    if (out) *out = g_last_defs;
+    return g_last_defs_n;
 }
 
 }  // namespace vector::native::unpack
